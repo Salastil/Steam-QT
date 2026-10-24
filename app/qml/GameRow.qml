@@ -211,7 +211,6 @@ Rectangle {
                 }
                 Button {
                     visible: root.dlc.length > 0
-                    flat: true
                     text: qsTr("Manage DLC…")
                     onClicked: dlcDialog.open()
                 }
