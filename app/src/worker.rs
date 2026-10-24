@@ -13,7 +13,7 @@ use steamqt_core::install::{self, InstallRequest, Progress, Runtime};
 use steamqt_core::launch::{self, CompatTool};
 use steamqt_core::library::{self, LibraryFolder};
 use steamqt_core::pics::AppDetails;
-use steamqt_core::session::{self, AuthStep, CodeChallenge, Credentials, Session};
+use steamqt_core::session::{self, AuthEvent, AuthStep, CodeSender, Credentials, Session};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -25,6 +25,8 @@ pub enum AuthState {
     NeedCode,
     NeedEmailCode,
     NeedMobile,
+    /// Either type the authenticator code or approve on the phone.
+    NeedCodeOrMobile,
     Ready,
 }
 
@@ -36,6 +38,7 @@ impl AuthState {
             AuthState::NeedCode => "needCode",
             AuthState::NeedEmailCode => "needEmailCode",
             AuthState::NeedMobile => "needMobile",
+            AuthState::NeedCodeOrMobile => "needCodeOrMobile",
             AuthState::Ready => "ready",
         }
     }
@@ -169,10 +172,11 @@ pub enum UiEvent {
 
 pub type Notify = Arc<dyn Fn(UiEvent) + Send + Sync>;
 
+#[allow(clippy::large_enum_variant)] // internal channel; boxing buys nothing here
 enum Msg {
     Cmd(Command),
     Authenticated(Result<AuthStep, String>),
-    CodeResult(Result<Credentials, (Option<CodeChallenge>, String)>),
+    Guard(AuthEvent),
     LoggedIn(Result<Session, String>, Option<Credentials>),
     CatalogLoaded(Result<Catalog, String>),
     Progress(u32, Progress),
@@ -225,7 +229,8 @@ struct Worker {
     settings: Settings,
     session: Option<Session>,
     remember: bool,
-    challenge: Option<CodeChallenge>,
+    /// Steam Guard in progress: where codes go, and the state to return to on a wrong code.
+    guard: Option<(CodeSender, AuthState)>,
     catalog: Catalog,
     filter_text: String,
     filter_mode: Filter,
@@ -318,7 +323,7 @@ impl Worker {
             settings,
             session: None,
             remember: true,
-            challenge: None,
+            guard: None,
             catalog: Catalog::default(),
             filter_text: String::new(),
             filter_mode: Filter::All,
@@ -416,34 +421,42 @@ impl Worker {
             Msg::Authenticated(result) => match result {
                 Err(e) => self.auth(AuthState::LoggedOut, e),
                 Ok(AuthStep::Done(creds)) => self.open_session(creds),
-                Ok(AuthStep::NeedCode { email, challenge }) => {
-                    self.challenge = Some(challenge);
-                    self.auth(
-                        if email {
-                            AuthState::NeedEmailCode
-                        } else {
-                            AuthState::NeedCode
-                        },
-                        "",
-                    );
-                }
-                Ok(AuthStep::NeedMobileApproval(approval)) => {
-                    self.auth(AuthState::NeedMobile, "");
+                Ok(AuthStep::Pending {
+                    code,
+                    email,
+                    mobile,
+                    auth,
+                }) => {
+                    let state = match (code, mobile) {
+                        (true, true) if !email => AuthState::NeedCodeOrMobile,
+                        (true, _) if email => AuthState::NeedEmailCode,
+                        (true, _) => AuthState::NeedCode,
+                        _ => AuthState::NeedMobile,
+                    };
+                    self.guard = Some((auth.codes, state));
+                    self.auth(state, "");
+                    let mut events = auth.events;
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
-                        let result = approval.wait().await.map_err(|e| (None, e.to_string()));
-                        let _ = tx.send(Msg::CodeResult(result));
+                        while let Some(event) = events.recv().await {
+                            let _ = tx.send(Msg::Guard(event));
+                        }
                     });
                 }
             },
-            Msg::CodeResult(Ok(creds)) => self.open_session(creds),
-            Msg::CodeResult(Err((challenge, e))) => match challenge {
-                Some(c) => {
-                    self.challenge = Some(c);
-                    self.auth(AuthState::NeedCode, format!("{e}. Try again."));
+            Msg::Guard(AuthEvent::Done(creds)) => {
+                self.guard = None;
+                self.open_session(creds);
+            }
+            Msg::Guard(AuthEvent::CodeRejected) => {
+                if let Some((_, state)) = &self.guard {
+                    self.auth(*state, "That code wasn't accepted. Try again.");
                 }
-                None => self.auth(AuthState::LoggedOut, e),
-            },
+            }
+            Msg::Guard(AuthEvent::Failed(e)) => {
+                self.guard = None;
+                self.auth(AuthState::LoggedOut, e.to_string());
+            }
             Msg::LoggedIn(Ok(session), creds) => {
                 if let Some(creds) = creds.filter(|_| self.remember) {
                     if let Err(e) = config::credentials::save(&creds) {
@@ -676,20 +689,13 @@ impl Worker {
                 });
             }
             Command::SubmitCode(code) => {
-                let Some(challenge) = self.challenge.take() else {
-                    return;
-                };
-                self.auth(AuthState::Working, "");
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let result = challenge
-                        .submit(&code)
-                        .await
-                        .map_err(|(c, e)| (c, e.to_string()));
-                    let _ = tx.send(Msg::CodeResult(result));
-                });
+                if let Some((codes, _)) = &self.guard {
+                    codes.submit(&code);
+                    self.auth(AuthState::Working, "");
+                }
             }
             Command::Logout => {
+                self.guard = None;
                 if let Some(active) = self.active.take() {
                     active.cancel.cancel();
                 }

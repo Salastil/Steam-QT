@@ -5,7 +5,7 @@ import QtQuick.Layouts
 Item {
     id: page
     readonly property string st: lib.authState
-    readonly property bool needCode: st === "needCode" || st === "needEmailCode"
+    readonly property bool needCode: st === "needCode" || st === "needEmailCode" || st === "needCodeOrMobile"
 
     Pane {
         anchors.centerIn: parent
@@ -67,7 +67,9 @@ Item {
                     color: win.subtle
                     text: page.st === "needEmailCode"
                           ? qsTr("Enter the code Steam sent to your email address.")
-                          : qsTr("Enter the code from the Steam Mobile app.")
+                          : page.st === "needCodeOrMobile"
+                            ? qsTr("Approve this sign-in in the Steam Mobile app, or enter the code it shows.")
+                            : qsTr("Enter the code from the Steam Mobile app.")
                 }
                 TextField {
                     id: codeField

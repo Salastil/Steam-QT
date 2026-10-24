@@ -14,6 +14,7 @@
 
 use crate::net;
 use crate::pics::{self, AppDetails, PackageDetails};
+use base64::Engine;
 use futures_util::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,16 +41,10 @@ use steam_vent_proto::steammessages_contentsystem_steamclient::{
 use steamroom::cdn::server::CdnServer;
 use steamroom::client::SteamClient;
 use steamroom::depot::DepotKey;
-use steamroom_client::login::{
-    ApprovedAuth, ClientOs, CredentialsLoginFlow, GuardChallenge, GuardType, LoginError,
-    MobileChallenge, PreparedLoginBuilder,
-};
+use steamroom_client::login::{GuardType, LoginError};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// `EOSType` reported at logon. -203 is `k_eLinuxUnknown`, which the official Linux client
-/// falls back to when it can't classify the kernel.
-const CLIENT_OS: ClientOs = ClientOs::new(-203);
 const PICS_BATCH: usize = 100;
 
 #[derive(Debug, thiserror::Error)]
@@ -175,67 +170,114 @@ pub struct Credentials {
 /// Interactive authentication state, driven by the UI.
 pub enum AuthStep {
     Done(Credentials),
-    /// Steam wants a code; `email` is true for an emailed code, false for the authenticator app.
-    NeedCode {
+    /// Steam Guard is required. `code` says a code can be typed (`email`: sent by email
+    /// rather than shown in the authenticator); `mobile` says the sign-in can also be
+    /// approved in the Steam Mobile app. Both may be true: whichever happens first wins.
+    Pending {
+        code: bool,
         email: bool,
-        challenge: CodeChallenge,
+        mobile: bool,
+        auth: PendingAuth,
     },
-    /// Steam is waiting for approval in the mobile app.
-    NeedMobileApproval(MobileApproval),
 }
 
-pub struct CodeChallenge {
-    account: String,
-    inner: GuardChallenge,
-    kind: GuardType,
+/// Outcome of a pending Steam Guard challenge.
+#[derive(Debug)]
+pub enum AuthEvent {
+    Done(Credentials),
+    /// The submitted code was wrong; another may be submitted.
+    CodeRejected,
+    Failed(SessionError),
 }
 
-pub struct MobileApproval {
-    account: String,
-    inner: MobileChallenge,
+/// A Steam Guard challenge in progress. One background task owns the auth connection and
+/// interleaves polling (which picks up a mobile approval) with code submissions, the way the
+/// official client does; steamroom's connection is request/response, so the two must not run
+/// concurrently.
+pub struct PendingAuth {
+    pub codes: CodeSender,
+    pub events: tokio::sync::mpsc::UnboundedReceiver<AuthEvent>,
 }
 
-fn finish(account: &str, approved: ApprovedAuth) -> Credentials {
-    let tokens = approved.tokens();
-    Credentials {
-        account: tokens
-            .account_name
-            .clone()
-            .unwrap_or_else(|| account.to_string()),
-        refresh_token: tokens.refresh_token.clone(),
+#[derive(Clone)]
+pub struct CodeSender(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl CodeSender {
+    pub fn submit(&self, code: &str) {
+        let _ = self.0.send(code.trim().to_string());
     }
 }
 
-impl CodeChallenge {
-    /// Submit a code. On a wrong code the challenge comes back for another attempt.
-    pub async fn submit(
-        self,
-        code: &str,
-    ) -> std::result::Result<Credentials, (Option<Self>, SessionError)> {
-        let Self {
-            account,
-            inner,
-            kind,
-        } = self;
-        match inner.submit_code(code.trim(), kind).await {
-            Ok(approved) => Ok(finish(&account, approved)),
-            Err((inner, LoginError::InvalidGuardCode)) => Err((
-                Some(Self {
-                    account,
-                    inner,
-                    kind,
-                }),
-                LoginError::InvalidGuardCode.into(),
-            )),
-            Err((_, e)) => Err((None, e.into())),
+fn eresult_of(e: &steamroom::Error) -> Option<&steamroom::enums::EResultError> {
+    match e {
+        steamroom::Error::Connection(steamroom::error::ConnectionError::ServiceMethodFailed(r)) => {
+            Some(r)
+        }
+        _ => None,
+    }
+}
+
+struct GuardSession {
+    client: SteamClient<steamroom::client::Ready>,
+    account: String,
+    client_id: u64,
+    steam_id: u64,
+    request_id: Vec<u8>,
+    interval: std::time::Duration,
+    code_kind: GuardType,
+}
+
+impl GuardSession {
+    fn credentials(&self, tokens: steamroom::auth::AuthTokens) -> Credentials {
+        Credentials {
+            account: tokens.account_name.unwrap_or_else(|| self.account.clone()),
+            refresh_token: tokens.refresh_token,
         }
     }
-}
 
-impl MobileApproval {
-    pub async fn wait(self) -> Result<Credentials> {
-        let approved = self.inner.wait_for_confirmation().await?;
-        Ok(finish(&self.account, approved))
+    async fn run(
+        self,
+        mut codes: tokio::sync::mpsc::UnboundedReceiver<String>,
+        events: tokio::sync::mpsc::UnboundedSender<AuthEvent>,
+    ) {
+        let mut ticker = tokio::time::interval(self.interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    match self.client.poll_auth_session(self.client_id, &self.request_id).await {
+                        Ok(Some(tokens)) => {
+                            let _ = events.send(AuthEvent::Done(self.credentials(tokens)));
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = events.send(AuthEvent::Failed(LoginError::Transport(e).into()));
+                            return;
+                        }
+                    }
+                }
+                code = codes.recv() => {
+                    let Some(code) = code else { return };
+                    match self.client.submit_steam_guard_code(self.client_id, self.steam_id, &code, self.code_kind).await {
+                        Ok(()) => ticker.reset_immediately(),
+                        Err(e) => match eresult_of(&e) {
+                            // 88 TwoFactorCodeMismatch (authenticator), 65 InvalidLoginAuthCode (email).
+                            Some(steamroom::enums::EResultError::TwoFactorCodeMismatch
+                                | steamroom::enums::EResultError::Unknown(65)) => {
+                                let _ = events.send(AuthEvent::CodeRejected);
+                            }
+                            // Already approved (e.g. on the phone): the next poll returns tokens.
+                            Some(steamroom::enums::EResultError::DuplicateRequest) => ticker.reset_immediately(),
+                            _ => {
+                                let _ = events.send(AuthEvent::Failed(LoginError::Transport(e).into()));
+                                return;
+                            }
+                        },
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -243,43 +285,111 @@ impl MobileApproval {
 pub async fn authenticate(account: &str, password: &str) -> Result<AuthStep> {
     let account = account.trim().to_string();
     let password = password.to_string();
-    let flow = connect_any(|ws| {
+    let (client, session) = connect_any(|ws| {
         let (account, password) = (account.clone(), password.clone());
         async move {
             let (client, _rx) = SteamClient::connect_ws(net::RoomTransport::new(ws))
                 .await
                 .map_err(LoginError::from)?;
-            let ready = client.prepare().await.map_err(LoginError::from)?;
-            Ok(PreparedLoginBuilder::new(ready)
-                .device_name(device_name())
-                .client_os(CLIENT_OS)
-                .with_credentials(account, password)
-                .begin()
-                .await?)
+            let client = client.prepare().await.map_err(LoginError::from)?;
+            let rsa = client
+                .get_password_rsa_public_key(&account)
+                .await
+                .map_err(LoginError::from)?;
+            let (Some(modulus), Some(exponent)) = (rsa.publickey_mod, rsa.publickey_exp) else {
+                return Err(LoginError::MissingField("publickey_mod").into());
+            };
+            let encrypted = steamroom::crypto::rsa::encrypt_with_rsa_public_key(
+                password.as_bytes(),
+                &modulus,
+                &exponent,
+            )
+            .map_err(|e| LoginError::Transport(e.into()))?;
+            let req = steamroom::generated::CAuthenticationBeginAuthSessionViaCredentialsRequest {
+                account_name: Some(account.clone()),
+                encrypted_password: Some(
+                    base64::engine::general_purpose::STANDARD.encode(&encrypted),
+                ),
+                encryption_timestamp: Some(rsa.timestamp.unwrap_or(0)),
+                remember_login: Some(true),
+                persistence: Some(1),
+                // EAuthTokenPlatformType::SteamClient: tokens valid for CM logon.
+                platform_type: Some(1),
+                device_friendly_name: Some(device_name()),
+                ..Default::default()
+            };
+            let session = match client.begin_auth_session_via_credentials(req).await {
+                Ok(s) => s,
+                Err(e)
+                    if matches!(
+                        eresult_of(&e),
+                        Some(steamroom::enums::EResultError::InvalidPassword)
+                    ) =>
+                {
+                    return Err(LoginError::InvalidPassword.into());
+                }
+                Err(e) => return Err(LoginError::Transport(e).into()),
+            };
+            Ok((client, session))
         }
     })
     .await?;
-    Ok(match flow {
-        CredentialsLoginFlow::Approved(approved) => AuthStep::Done(finish(&account, approved)),
-        CredentialsLoginFlow::NeedsGuardCode(inner) => {
-            let kind = if inner.allowed_kinds().contains(&GuardType::DeviceCode) {
-                GuardType::DeviceCode
-            } else {
-                GuardType::EmailCode
-            };
-            AuthStep::NeedCode {
-                email: kind == GuardType::EmailCode,
-                challenge: CodeChallenge {
-                    account,
-                    inner,
-                    kind,
-                },
+
+    let guard = GuardSession {
+        client,
+        account: account.clone(),
+        client_id: session
+            .client_id
+            .ok_or(LoginError::MissingField("client_id"))?,
+        steam_id: session
+            .steam_id
+            .ok_or(LoginError::MissingField("steamid"))?,
+        request_id: session
+            .request_id
+            .ok_or(LoginError::MissingField("request_id"))?,
+        interval: std::time::Duration::from_secs_f32(
+            session.poll_interval.unwrap_or(5.0).clamp(1.0, 10.0),
+        ),
+        code_kind: if session
+            .allowed_confirmations
+            .contains(&GuardType::DeviceCode)
+        {
+            GuardType::DeviceCode
+        } else {
+            GuardType::EmailCode
+        },
+    };
+    let allowed = &session.allowed_confirmations;
+    if allowed.is_empty() || allowed.contains(&GuardType::None) {
+        // No Steam Guard: tokens are ready after the first poll.
+        loop {
+            tokio::time::sleep(guard.interval).await;
+            if let Some(tokens) = guard
+                .client
+                .poll_auth_session(guard.client_id, &guard.request_id)
+                .await
+                .map_err(LoginError::from)?
+            {
+                return Ok(AuthStep::Done(guard.credentials(tokens)));
             }
         }
-        CredentialsLoginFlow::NeedsMobileConfirm(inner) => {
-            AuthStep::NeedMobileApproval(MobileApproval { account, inner })
-        }
-        _ => return Err(SessionError::Other("unsupported Steam Guard flow".into())),
+    }
+    let code = allowed
+        .iter()
+        .any(|g| matches!(g, GuardType::DeviceCode | GuardType::EmailCode));
+    let email = code && guard.code_kind == GuardType::EmailCode;
+    let mobile = allowed.contains(&GuardType::DeviceConfirmation);
+    let (code_tx, code_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(guard.run(code_rx, event_tx));
+    Ok(AuthStep::Pending {
+        code,
+        email,
+        mobile,
+        auth: PendingAuth {
+            codes: CodeSender(code_tx),
+            events: event_rx,
+        },
     })
 }
 
