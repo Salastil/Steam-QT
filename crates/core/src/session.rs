@@ -106,6 +106,9 @@ pub async fn discover_cms(cell_id: u32) -> Result<Vec<String>> {
         .filter(|e| e.kind == "websockets")
         .map(|e| e.endpoint)
         .collect();
+    // Port 443 passes restrictive firewalls and HTTPS proxies; keep load order otherwise.
+    let mut list = list;
+    list.sort_by_key(|e| !e.ends_with(":443"));
     if list.is_empty() {
         return Err(SessionError::Directory(
             "no WebSocket servers listed".into(),
@@ -133,7 +136,7 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut last = SessionError::Directory("no servers tried".into());
-    for endpoint in discover_cms(0).await?.iter().take(4) {
+    for endpoint in discover_cms(0).await?.iter().take(6) {
         let url = net::cm_url(endpoint);
         match net::connect_ws(&url).await {
             Ok(ws) => match f(ws).await {
@@ -348,10 +351,14 @@ impl Session {
             .last();
         let list = match buffered {
             Some(list) => Some(list),
-            None => tokio::time::timeout(Duration::from_secs(15), first)
-                .await
-                .ok()
-                .and_then(|r| r.ok()),
+            // Anonymous sessions get no licence list, so don't wait long for one.
+            None => {
+                let wait = Duration::from_secs(if account.is_some() { 15 } else { 2 });
+                tokio::time::timeout(wait, first)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }
         };
         let licenses: Vec<License> = list
             .map(|l| l.licenses.iter().map(License::from).collect())
