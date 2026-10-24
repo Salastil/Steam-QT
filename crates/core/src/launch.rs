@@ -159,15 +159,33 @@ pub fn select_launch_entry<'a>(
     branch: Option<&str>,
 ) -> Option<&'a LaunchEntry> {
     let os = runtime.target_os();
-    let mut candidates: Vec<&LaunchEntry> = app
+    let for_os: Vec<&LaunchEntry> = app
         .launch
         .iter()
         .filter(|l| match runtime {
             Runtime::Native => l.oslist.iter().any(|o| o == os),
             Runtime::Proton => l.oslist.is_empty() || l.oslist.iter().any(|o| o == os),
         })
-        .filter(|l| l.beta_key.as_deref().is_none_or(|b| Some(b) == branch))
         .collect();
+    // `betakey` lists the branches an entry applies to, space separated (it may include
+    // "public"); no betakey means every branch. When nothing matches the current branch
+    // (EU5 tags every entry for old branches only), Steam still launches, so fall back to
+    // all entries for the OS.
+    let current = branch.unwrap_or("public");
+    let for_branch: Vec<&LaunchEntry> = for_os
+        .iter()
+        .copied()
+        .filter(|l| {
+            l.beta_key
+                .as_deref()
+                .is_none_or(|keys| keys.split_whitespace().any(|k| k == current))
+        })
+        .collect();
+    let mut candidates = if for_branch.is_empty() {
+        for_os
+    } else {
+        for_branch
+    };
     // Prefer: entries for the current beta, 64-bit, then the default type, in PICS order.
     candidates.sort_by_key(|l| {
         (
@@ -390,6 +408,7 @@ mod tests {
                 "1" { "executable" "bin/win32/game.exe" "config" { "oslist" "windows" "osarch" "32" } }
                 "2" { "executable" "game.sh" "workingdir" "bin" "config" { "oslist" "linux" } }
                 "3" { "executable" "game_beta.sh" "config" { "oslist" "linux" "betakey" "beta" } }
+                "5" { "executable" "old.exe" "config" { "oslist" "windows" "osarch" "64" "betakey" "1.29 1.30" } }
                 "4" { "executable" "tool.sh" "type" "option1" "config" { "oslist" "linux" } }
             } }
         }"#;
