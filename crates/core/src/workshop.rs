@@ -228,7 +228,13 @@ pub async fn sync_items(
         report.removed += 1;
     }
 
-    let depot_id = app.workshop_depot.unwrap_or(app.app_id);
+    // Item content normally lives on a depot with the app's own id (DepotDownloader and
+    // steamroom both use it); some apps name a separate `workshopdepot`, tried second.
+    let mut depots = vec![app.app_id];
+    if let Some(d) = app.workshop_depot.filter(|&d| d != app.app_id) {
+        depots.push(d);
+    }
+    let depot_id = depots[0];
     let mut cdn: Option<CdnContext> = None;
     for item in items {
         let installed = state.items.get(&item.id);
@@ -247,17 +253,24 @@ pub async fn sync_items(
             let old = installed
                 .map(|i| i.manifest)
                 .filter(|&m| m != 0 && m != item.manifest);
-            download_item(
-                session,
-                cdn.as_ref().expect("set above"),
-                app.app_id,
-                depot_id,
-                item,
-                old,
-                lib,
-                &dir,
-            )
-            .await
+            let mut result = Err(InstallError::Depot(depot_id, "no workshop depot".into()));
+            for &depot in &depots {
+                result = download_item(
+                    session,
+                    cdn.as_ref().expect("set above"),
+                    app.app_id,
+                    depot,
+                    item,
+                    old,
+                    lib,
+                    &dir,
+                )
+                .await;
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result
         } else if let Some(url) = &item.file_url {
             download_legacy(url, item.filename.as_deref(), &dir).await
         } else {
@@ -311,7 +324,10 @@ async fn download_item(
         },
         dlc_app_id: None,
     };
-    let manifest = install::fetch_manifest(session, cdn, app_id, &planned, None, &key, lib).await?;
+    // UGC manifests need a request code obtained for the public branch (DepotDownloader's
+    // DownloadPubfileAsync uses DEFAULT_BRANCH); without it every CDN answers 404.
+    let manifest =
+        install::fetch_manifest(session, cdn, app_id, &planned, Some("public"), &key, lib).await?;
     let mut builder = DepotJob::builder()
         .depot_id(DepotId(depot_id))
         .depot_key(key.clone())

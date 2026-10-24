@@ -307,7 +307,8 @@ pub(crate) async fn fetch_manifest(
         .manifest_request_code(app_id, depot.depot_id, depot.manifest.gid, branch)
         .await
         .unwrap_or_else(|e| {
-            debug!(depot = depot.depot_id, error = %e, "no manifest request code");
+            // Old manifests download without a code; current ones 404 without it.
+            warn!(depot = depot.depot_id, manifest = depot.manifest.gid, error = %e, "no manifest request code");
             0
         });
     let pool = CdnServerPool::new(cdn.servers.clone());
