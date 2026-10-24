@@ -44,6 +44,9 @@ pub struct Settings {
     pub bandwidth_limit_kib: u32,
     pub language: String,
     pub remember_account: Option<String>,
+    /// Per-app runtime choice ("native"/"proton") for apps not yet installed, keyed by app id
+    /// (string keys: TOML tables cannot have integer keys).
+    pub runtime_choice: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -56,6 +59,7 @@ impl Default for Settings {
             bandwidth_limit_kib: 0,
             language: "english".into(),
             remember_account: None,
+            runtime_choice: Default::default(),
         }
     }
 }

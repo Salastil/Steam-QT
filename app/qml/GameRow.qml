@@ -1,0 +1,285 @@
+// One game in the library list, with its runtime toggle, primary action and ⋮ menu.
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Rectangle {
+    id: root
+    property var row
+    property bool expanded: false
+    signal toggleExpanded()
+    signal installRequested()
+
+    readonly property bool installed: row.section === "installed"
+    readonly property var dlc: { try { return JSON.parse(row.dlcJson) } catch (e) { return [] } }
+    readonly property string storeUrl: "https://store.steampowered.com/app/" + row.appId
+
+    implicitHeight: col.implicitHeight
+    color: hover.hovered ? win.hoverTint : palette.base
+    border.color: win.frame
+
+    HoverHandler { id: hover }
+    TapHandler { onTapped: root.toggleExpanded() }
+
+    ColumnLayout {
+        id: col
+        width: parent.width
+        spacing: 0
+
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.margins: 10
+            spacing: 12
+
+            // Capsule icon, with initials until (or unless) the image loads.
+            Rectangle {
+                width: 40; height: 40; radius: 4
+                color: Qt.hsla((root.row.appId % 360) / 360, 0.45, 0.42, 1)
+                Label {
+                    anchors.centerIn: parent
+                    visible: icon.status !== Image.Ready
+                    color: "white"
+                    font.bold: true
+                    font.pixelSize: 15
+                    text: root.row.title.split(/\s+/).filter(w => w.length).map(w => w[0]).join("").slice(0, 2)
+                }
+                Image {
+                    id: icon
+                    anchors.fill: parent
+                    source: root.row.iconUrl
+                    asynchronous: true
+                    fillMode: Image.PreserveAspectCrop
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 2
+                Label {
+                    text: root.row.title
+                    font.pixelSize: 15
+                    font.weight: Font.Medium
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: root.row.size + " · " + root.row.status
+                    color: root.row.gameState === "update" || root.row.gameState === "paused" ? win.neutral
+                         : root.row.gameState === "downloading" ? palette.highlight : win.subtle
+                    font.pixelSize: 12
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+            }
+
+            // Which build runs: both available → toggle; otherwise a fixed label.
+            Segmented {
+                visible: root.row.os === "both"
+                small: true
+                options: ["Native", "Proton"]
+                current: root.row.runtime === "native" ? "Native" : "Proton"
+                onPicked: (o) => lib.setRuntime(root.row.appId, o.toLowerCase())
+            }
+            Label {
+                visible: root.row.os !== "both"
+                text: root.row.os === "linux" ? qsTr("Native") : qsTr("Proton")
+                color: win.subtle
+                font.pixelSize: 12
+                rightPadding: 4
+            }
+
+            // Primary action
+            Item {
+                implicitWidth: 124
+                implicitHeight: 32
+                Button {
+                    anchors.fill: parent
+                    visible: root.row.gameState !== "downloading"
+                    highlighted: root.row.gameState === "ready" || root.row.gameState === "update"
+                    font.pixelSize: 13
+                    text: {
+                        switch (root.row.gameState) {
+                        case "none": return "⬇  " + qsTr("Install")
+                        case "update": return "⬇  " + qsTr("Update")
+                        case "paused": return "▶  " + qsTr("Resume")
+                        case "queued": return qsTr("Queued")
+                        default: return "▶  " + qsTr("Play")
+                        }
+                    }
+                    onClicked: {
+                        switch (root.row.gameState) {
+                        case "none": root.installRequested(); break
+                        case "update":
+                        case "paused": lib.update(root.row.appId); break
+                        case "queued": lib.pause(root.row.appId); break
+                        default: lib.play(root.row.appId)
+                        }
+                    }
+                }
+                RowLayout {
+                    anchors.fill: parent
+                    visible: root.row.gameState === "downloading"
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 8
+                        radius: 4
+                        color: win.frame
+                        Rectangle {
+                            width: parent.width * root.row.progress
+                            height: parent.height
+                            radius: 4
+                            color: palette.highlight
+                        }
+                    }
+                    Label { text: Math.round(root.row.progress * 100) + "%"; font.pixelSize: 12 }
+                    ToolButton {
+                        text: "❚❚"
+                        font.pixelSize: 9
+                        implicitWidth: 26
+                        implicitHeight: 26
+                        padding: 0
+                        onClicked: lib.pause(root.row.appId)
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Pause")
+                    }
+                }
+            }
+
+            ToolButton {
+                id: more
+                text: "⋮"
+                font.pixelSize: 18
+                implicitWidth: 30
+                onClicked: menu.popup(more, more.width - menu.width, more.height)
+            }
+        }
+
+        // Details shown when the row is clicked.
+        GridLayout {
+            visible: root.expanded
+            Layout.fillWidth: true
+            Layout.leftMargin: 62
+            Layout.rightMargin: 12
+            Layout.bottomMargin: 12
+            columns: 4
+            columnSpacing: 16
+            rowSpacing: 6
+            Label { text: qsTr("Build"); color: win.subtle; visible: root.installed }
+            Label { text: root.row.build; visible: root.installed }
+            Label { text: qsTr("Branch"); color: win.subtle; visible: root.installed }
+            Label { text: root.row.branch; visible: root.installed }
+            Label { text: qsTr("Updated"); color: win.subtle; visible: root.installed }
+            Label { text: root.row.updated; visible: root.installed }
+            Label { text: qsTr("App ID"); color: win.subtle }
+            Label { text: root.row.appId }
+            Label { text: qsTr("DLC"); color: win.subtle }
+            Label {
+                Layout.columnSpan: 3
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: root.dlc.length === 0 ? qsTr("None owned")
+                    : root.dlc.map(d => d.name + (d.enabled ? "" : " (off)")).join(", ")
+            }
+            Label { text: qsTr("Location"); color: win.subtle; visible: root.installed }
+            Label {
+                visible: root.installed
+                text: root.row.location
+                elide: Text.ElideMiddle
+                Layout.columnSpan: 3
+                Layout.fillWidth: true
+            }
+        }
+    }
+
+    Menu {
+        id: menu
+        MenuItem {
+            text: root.installed ? "▶  " + qsTr("Play") : "⬇  " + qsTr("Install…")
+            onTriggered: root.installed ? lib.play(root.row.appId) : root.installRequested()
+        }
+        MenuItem {
+            text: qsTr("Update now")
+            visible: root.installed
+            height: visible ? implicitHeight : 0
+            onTriggered: lib.update(root.row.appId)
+        }
+        Menu {
+            title: qsTr("Runtime")
+            MenuItem {
+                text: qsTr("Native (Linux build)")
+                checkable: true
+                checked: root.row.runtime === "native"
+                enabled: root.row.os !== "windows"
+                onTriggered: lib.setRuntime(root.row.appId, "native")
+            }
+            MenuItem {
+                text: qsTr("Proton (Windows build)")
+                checkable: true
+                checked: root.row.runtime === "proton"
+                enabled: root.row.os !== "linux"
+                onTriggered: lib.setRuntime(root.row.appId, "proton")
+            }
+        }
+        Menu {
+            id: dlcMenu
+            title: qsTr("DLC")
+            Instantiator {
+                model: root.dlc
+                delegate: MenuItem {
+                    required property var modelData
+                    text: modelData.name
+                    checkable: true
+                    checked: modelData.enabled
+                    enabled: root.installed && modelData.content
+                    onTriggered: lib.setDlc(root.row.appId, modelData.id, checked)
+                }
+                onObjectAdded: (i, o) => dlcMenu.insertItem(i, o)
+                onObjectRemoved: (i, o) => dlcMenu.removeItem(o)
+            }
+            MenuSeparator { visible: root.dlc.length > 0 }
+            MenuItem {
+                text: qsTr("Get more DLC in browser ↗")
+                onTriggered: Qt.openUrlExternally("https://store.steampowered.com/dlc/" + root.row.appId)
+            }
+        }
+        MenuItem {
+            text: qsTr("Workshop in browser ↗")
+            onTriggered: Qt.openUrlExternally("https://steamcommunity.com/app/" + root.row.appId + "/workshop/")
+        }
+        MenuSeparator {}
+        MenuItem {
+            text: qsTr("Verify files")
+            visible: root.installed
+            height: visible ? implicitHeight : 0
+            onTriggered: lib.verify(root.row.appId)
+        }
+        MenuItem {
+            text: qsTr("Browse local files")
+            visible: root.installed
+            height: visible ? implicitHeight : 0
+            onTriggered: Qt.openUrlExternally("file://" + root.row.location)
+        }
+        MenuItem {
+            text: qsTr("Open store page ↗")
+            onTriggered: Qt.openUrlExternally(root.storeUrl)
+        }
+        MenuSeparator { visible: root.installed }
+        MenuItem {
+            text: qsTr("Uninstall")
+            visible: root.installed
+            height: visible ? implicitHeight : 0
+            onTriggered: confirmUninstall.open()
+        }
+    }
+
+    Dialog {
+        id: confirmUninstall
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        title: qsTr("Uninstall %1?").arg(root.row.title)
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        Label { text: qsTr("Game files will be deleted. Proton prefixes (save data) are kept.") }
+        onAccepted: lib.uninstall(root.row.appId)
+    }
+}
