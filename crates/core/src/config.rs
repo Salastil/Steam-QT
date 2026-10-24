@@ -47,6 +47,10 @@ pub struct Settings {
     /// Per-app runtime choice ("native"/"proton") for apps not yet installed, keyed by app id
     /// (string keys: TOML tables cannot have integer keys).
     pub runtime_choice: std::collections::BTreeMap<String, String>,
+    /// Per-app compatibility tool key (see `launch::CompatTool::key`), keyed by app id.
+    pub proton_choice: std::collections::BTreeMap<String, String>,
+    /// Per-app Steam-style launch options (`ENV=1 %command% -args`), keyed by app id.
+    pub launch_options: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -54,12 +58,14 @@ impl Default for Settings {
         Self {
             libraries: Vec::new(),
             default_library: 0,
-            default_proton: "proton_experimental".into(),
+            default_proton: "1493710".into(),
             auto_update: true,
             bandwidth_limit_kib: 0,
             language: "english".into(),
             remember_account: None,
             runtime_choice: Default::default(),
+            proton_choice: Default::default(),
+            launch_options: Default::default(),
         }
     }
 }
@@ -74,10 +80,16 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut settings: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Tool keys are Steam app ids or `custom:<dir>`; anything else falls back to the default.
+        let key = &settings.default_proton;
+        if key.parse::<u32>().is_err() && !key.starts_with("custom:") {
+            settings.default_proton = Self::default().default_proton;
+        }
+        settings
     }
 
     pub fn save(&self) -> std::io::Result<()> {

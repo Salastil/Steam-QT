@@ -144,6 +144,37 @@ ScrollView {
         }
 
         Label {
+            text: qsTr("Proton")
+            font.pixelSize: 17
+            font.weight: Font.DemiBold
+            Layout.leftMargin: 16
+            Layout.topMargin: 12
+        }
+        RowLayout {
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
+            spacing: 12
+            readonly property var tools: { try { return JSON.parse(lib.toolsJson) } catch (e) { return [] } }
+            Label { text: qsTr("Default for Windows games"); color: win.subtle }
+            ComboBox {
+                id: protonCombo
+                Layout.preferredWidth: 320
+                model: parent.tools.map(t => t.name + (t.installed ? "" : qsTr(" (not installed)")))
+                currentIndex: parent.tools.findIndex(t => t.key === lib.defaultProton)
+                onActivated: (i) => lib.selectDefaultProton(parent.tools[i].key)
+            }
+        }
+        Label {
+            Layout.leftMargin: 16
+            Layout.rightMargin: 16
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            color: win.subtle
+            text: qsTr("Valve's Proton builds download automatically the first time a game needs them. "
+                     + "Custom builds (e.g. GE-Proton) placed in compatibilitytools.d are listed too.")
+        }
+
+        Label {
             text: qsTr("Updates")
             font.pixelSize: 17
             font.weight: Font.DemiBold

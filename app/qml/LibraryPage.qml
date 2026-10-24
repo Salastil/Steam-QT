@@ -61,6 +61,9 @@ Item {
                 required property string updated
                 required property string location
                 required property string dlcJson
+                required property string proton
+                required property string protonKey
+                required property string launchOptions
                 sourceComponent: header ? headerComponent : rowComponent
 
                 Component {

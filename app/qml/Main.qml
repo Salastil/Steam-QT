@@ -182,7 +182,7 @@ ApplicationWindow {
     readonly property var devArgs: {
         const o = {}
         for (const a of Qt.application.arguments) {
-            const m = a.match(/^--(screenshot|page|delay|expand)=(.*)$/)
+            const m = a.match(/^--(screenshot|page|delay|expand|play)=(.*)$/)
             if (m) o[m[1]] = m[2]
         }
         return o
@@ -190,9 +190,12 @@ ApplicationWindow {
     Component.onCompleted: if (devArgs.page) page = devArgs.page
     Connections {
         target: lib
-        enabled: win.devArgs.expand !== undefined
+        enabled: win.devArgs.expand !== undefined || win.devArgs.play !== undefined
         function onFooterChanged() {
-            if (lib.footer.endsWith("in library")) { lib.toggleSection(win.devArgs.expand); enabled = false }
+            if (!lib.footer.endsWith("in library")) return
+            if (win.devArgs.expand) lib.toggleSection(win.devArgs.expand)
+            if (win.devArgs.play) lib.play(parseInt(win.devArgs.play))
+            enabled = false
         }
     }
     Timer {

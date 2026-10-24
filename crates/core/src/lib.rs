@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod config;
 pub mod install;
+pub mod launch;
 pub mod library;
 pub mod net;
 pub mod pics;

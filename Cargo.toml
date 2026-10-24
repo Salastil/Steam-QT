@@ -14,3 +14,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+
+[profile.dev]
+# Full debug info for Qt/cxx bindings makes target/ very large; line tables keep backtraces.
+debug = "line-tables-only"

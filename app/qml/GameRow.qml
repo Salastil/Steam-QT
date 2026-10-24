@@ -13,6 +13,7 @@ Rectangle {
     readonly property bool installed: row.section === "installed"
     readonly property var dlc: { try { return JSON.parse(row.dlcJson) } catch (e) { return [] } }
     readonly property string storeUrl: "https://store.steampowered.com/app/" + row.appId
+    readonly property var tools: { try { return JSON.parse(lib.toolsJson) } catch (e) { return [] } }
 
     implicitHeight: col.implicitHeight
     color: hover.hovered ? win.hoverTint : palette.base
@@ -81,11 +82,22 @@ Rectangle {
                 onPicked: (o) => lib.setRuntime(root.row.appId, o.toLowerCase())
             }
             Label {
-                visible: root.row.os !== "both"
-                text: root.row.os === "linux" ? qsTr("Native") : qsTr("Proton")
+                visible: root.row.os === "linux"
+                text: qsTr("Native")
                 color: win.subtle
                 font.pixelSize: 12
                 rightPadding: 4
+            }
+            Button {
+                id: protonButton
+                visible: root.row.os === "windows" || (root.row.os === "both" && root.row.runtime === "proton")
+                flat: true
+                font.pixelSize: 12
+                implicitHeight: 26
+                text: root.row.proton + " ▾"
+                onClicked: protonMenu.popup(protonButton, 0, protonButton.height)
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Compatibility tool")
             }
 
             // Primary action
@@ -103,6 +115,7 @@ Rectangle {
                         case "update": return "⬇  " + qsTr("Update")
                         case "paused": return "▶  " + qsTr("Resume")
                         case "queued": return qsTr("Queued")
+                        case "running": return "■  " + qsTr("Stop")
                         default: return "▶  " + qsTr("Play")
                         }
                     }
@@ -112,6 +125,7 @@ Rectangle {
                         case "update":
                         case "paused": lib.update(root.row.appId); break
                         case "queued": lib.pause(root.row.appId); break
+                        case "running": lib.stop(root.row.appId); break
                         default: lib.play(root.row.appId)
                         }
                     }
@@ -172,6 +186,14 @@ Rectangle {
             Label { text: root.row.updated; visible: root.installed }
             Label { text: qsTr("App ID"); color: win.subtle }
             Label { text: root.row.appId }
+            Label { text: qsTr("Launch options"); color: win.subtle; visible: root.installed }
+            Label {
+                visible: root.installed
+                text: root.row.launchOptions.length ? root.row.launchOptions : qsTr("none")
+                elide: Text.ElideRight
+                Layout.columnSpan: 3
+                Layout.fillWidth: true
+            }
             Label { text: qsTr("DLC"); color: win.subtle }
             Label {
                 Layout.columnSpan: 3
@@ -243,6 +265,12 @@ Rectangle {
             }
         }
         MenuItem {
+            text: qsTr("Launch options…")
+            visible: root.installed
+            height: visible ? implicitHeight : 0
+            onTriggered: launchDialog.open()
+        }
+        MenuItem {
             text: qsTr("Workshop in browser ↗")
             onTriggered: Qt.openUrlExternally("https://steamcommunity.com/app/" + root.row.appId + "/workshop/")
         }
@@ -269,6 +297,57 @@ Rectangle {
             visible: root.installed
             height: visible ? implicitHeight : 0
             onTriggered: confirmUninstall.open()
+        }
+    }
+
+    // Compatibility tool choice for this game.
+    Menu {
+        id: protonMenu
+        MenuItem {
+            text: qsTr("Default")
+            checkable: true
+            checked: root.row.protonKey === ""
+            onTriggered: lib.setProtonFor(root.row.appId, "")
+        }
+        MenuSeparator {}
+        Instantiator {
+            model: root.tools
+            delegate: MenuItem {
+                required property var modelData
+                text: modelData.name + (modelData.installed ? "" : qsTr(" (downloads on first launch)"))
+                checkable: true
+                checked: root.row.protonKey === modelData.key
+                onTriggered: lib.setProtonFor(root.row.appId, modelData.key)
+            }
+            onObjectAdded: (i, o) => protonMenu.insertItem(i + 2, o)
+            onObjectRemoved: (i, o) => protonMenu.removeItem(o)
+        }
+    }
+
+    Dialog {
+        id: launchDialog
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(520, parent.width - 32)
+        modal: true
+        title: qsTr("Launch options — %1").arg(root.row.title)
+        standardButtons: Dialog.Cancel | Dialog.Save
+        onAboutToShow: optionsField.text = root.row.launchOptions
+        onAccepted: lib.setLaunchOptions(root.row.appId, optionsField.text)
+        ColumnLayout {
+            anchors.fill: parent
+            TextField {
+                id: optionsField
+                Layout.fillWidth: true
+                placeholderText: "PROTON_LOG=1 gamemoderun %command% -novid"
+                onAccepted: launchDialog.accept()
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: win.subtle
+                text: qsTr("Same syntax as Steam: variables and wrappers before %command%, game arguments after it.")
+            }
         }
     }
 

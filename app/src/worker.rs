@@ -10,7 +10,9 @@ use std::time::Duration;
 use steamqt_core::catalog::{self, Catalog, Entry};
 use steamqt_core::config::{self, Settings};
 use steamqt_core::install::{self, InstallRequest, Progress, Runtime};
+use steamqt_core::launch::{self, CompatTool};
 use steamqt_core::library::{self, LibraryFolder};
+use steamqt_core::pics::AppDetails;
 use steamqt_core::session::{self, AuthStep, CodeChallenge, Credentials, Session};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +86,17 @@ pub enum Command {
     SetDefaultLibrary(usize),
     SetAutoUpdate(bool),
     Play(u32),
+    Stop(u32),
+    SetDefaultProton(String),
+    /// Empty key = use the default.
+    SetProtonFor {
+        app_id: u32,
+        key: String,
+    },
+    SetLaunchOptions {
+        app_id: u32,
+        options: String,
+    },
 }
 
 /// One row of the library list: either a section header or a game.
@@ -111,6 +124,18 @@ pub struct Row {
     pub location: String,
     /// JSON list of {id, name, enabled, content}.
     pub dlc_json: String,
+    /// Compatibility tool used for this game (Proton builds only).
+    pub proton: String,
+    /// Selected tool key, empty when following the default.
+    pub proton_key: String,
+    pub launch_options: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ToolInfo {
+    pub key: String,
+    pub name: String,
+    pub installed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -125,13 +150,20 @@ pub struct LibraryInfo {
 
 #[derive(Debug)]
 pub enum UiEvent {
-    Auth { state: AuthState, error: String },
+    Auth {
+        state: AuthState,
+        error: String,
+    },
     Account(String),
     Rows(Vec<Row>),
     Libraries(Vec<LibraryInfo>),
     Footer(String),
     Message(String),
     AutoUpdate(bool),
+    Tools {
+        tools: Vec<ToolInfo>,
+        default: String,
+    },
 }
 
 pub type Notify = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -144,6 +176,8 @@ enum Msg {
     CatalogLoaded(Result<Catalog, String>),
     Progress(u32, Progress),
     InstallDone(u32, Result<(), String>),
+    ToolsFetched(Result<Vec<AppDetails>, String>),
+    Exited(u32, String),
 }
 
 pub struct Handle {
@@ -199,6 +233,12 @@ struct Worker {
     pending_library: HashMap<u32, usize>,
     /// `STEAMQT_DEMO=440,570,...`: anonymous session with these apps as the library.
     demo: Option<Vec<u32>>,
+    /// Tool apps (Proton, Steam Linux Runtime) that aren't library items.
+    tools: HashMap<u32, AppDetails>,
+    /// Game to start once the downloads it waits for (update, Proton, runtime) finish.
+    pending_launch: Option<u32>,
+    /// Running games: app id → process group id.
+    running: HashMap<u32, i32>,
 }
 
 fn human_size(bytes: u64) -> String {
@@ -277,6 +317,9 @@ impl Worker {
             paused: HashSet::new(),
             install_size_cache: HashMap::new(),
             pending_library: HashMap::new(),
+            tools: HashMap::new(),
+            pending_launch: None,
+            running: HashMap::new(),
             demo: std::env::var("STEAMQT_DEMO")
                 .ok()
                 .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()),
@@ -296,6 +339,7 @@ impl Worker {
 
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         self.publish_libraries();
+        self.publish_tools();
         self.emit(UiEvent::AutoUpdate(self.settings.auto_update));
         self.try_resume();
         let mut update_timer = tokio::time::interval(Duration::from_secs(30 * 60));
@@ -452,6 +496,22 @@ impl Worker {
                     self.publish();
                 }
             }
+            Msg::ToolsFetched(Ok(apps)) => {
+                for app in apps {
+                    let id = app.app_id;
+                    self.tools.insert(id, app);
+                    self.enqueue(id, false);
+                }
+            }
+            Msg::ToolsFetched(Err(e)) => {
+                self.pending_launch = None;
+                self.emit(UiEvent::Message(format!("Could not get Proton: {e}")));
+            }
+            Msg::Exited(app_id, status) => {
+                self.running.remove(&app_id);
+                info!(app_id, %status, "game exited");
+                self.publish();
+            }
             Msg::InstallDone(app_id, result) => {
                 self.active = None;
                 match result {
@@ -470,6 +530,13 @@ impl Worker {
                 self.start_next();
                 self.publish();
                 self.publish_libraries();
+                self.publish_tools();
+                if self.active.is_none()
+                    && self.queue.is_empty()
+                    && let Some(pending) = self.pending_launch.take()
+                {
+                    self.play(pending);
+                }
             }
         }
     }
@@ -636,15 +703,38 @@ impl Worker {
                 let _ = self.settings.save();
                 self.emit(UiEvent::AutoUpdate(on));
             }
-            Command::Play(app_id) => {
-                let name = self
-                    .catalog
-                    .get(app_id)
-                    .map(|e| e.app.name.clone())
-                    .unwrap_or_default();
-                self.emit(UiEvent::Message(format!(
-                    "Launching is not implemented yet ({name})."
-                )));
+            Command::Play(app_id) => self.play(app_id),
+            Command::Stop(app_id) => {
+                if let Some(&pgid) = self.running.get(&app_id) {
+                    // SAFETY: signalling a process group we spawned; harmless if it has exited.
+                    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                }
+            }
+            Command::SetDefaultProton(key) => {
+                self.settings.default_proton = key;
+                let _ = self.settings.save();
+                self.publish_tools();
+                self.publish();
+            }
+            Command::SetProtonFor { app_id, key } => {
+                if key.is_empty() {
+                    self.settings.proton_choice.remove(&app_id.to_string());
+                } else {
+                    self.settings.proton_choice.insert(app_id.to_string(), key);
+                }
+                let _ = self.settings.save();
+                self.publish();
+            }
+            Command::SetLaunchOptions { app_id, options } => {
+                if options.trim().is_empty() {
+                    self.settings.launch_options.remove(&app_id.to_string());
+                } else {
+                    self.settings
+                        .launch_options
+                        .insert(app_id.to_string(), options.trim().to_string());
+                }
+                let _ = self.settings.save();
+                self.publish();
             }
         }
     }
@@ -775,8 +865,26 @@ impl Worker {
             return;
         };
         while let Some((app_id, verify)) = self.queue.pop_front() {
-            let Some(entry) = self.catalog.get(app_id) else {
-                continue;
+            let tool_entry;
+            let entry = match self.catalog.get(app_id) {
+                Some(e) => e,
+                None => {
+                    // Tool apps install like games, into the library they're already in or the default.
+                    let Some(app) = self.tools.get(&app_id).cloned() else {
+                        continue;
+                    };
+                    let installed = catalog::scan_installed(&self.settings).remove(&app_id);
+                    tool_entry = Entry {
+                        app,
+                        install: installed.map(|(library, manifest)| catalog::Installed {
+                            library,
+                            manifest,
+                            update_available: true,
+                        }),
+                        dlc: Vec::new(),
+                    };
+                    &tool_entry
+                }
             };
             let library = match &entry.install {
                 Some(i) => self.settings.libraries.get(i.library).cloned(),
@@ -796,7 +904,11 @@ impl Worker {
             let req = InstallRequest {
                 app: entry.app.clone(),
                 library,
-                runtime: self.chosen_runtime(entry),
+                runtime: if self.tools.contains_key(&app_id) {
+                    Runtime::Native
+                } else {
+                    self.chosen_runtime(entry)
+                },
                 branch: installed
                     .and_then(|m| m.beta_key.clone())
                     .unwrap_or_else(|| "public".into()),
@@ -839,6 +951,170 @@ impl Worker {
             });
             return;
         }
+    }
+
+    fn proton_key_for(&self, app_id: u32) -> String {
+        self.settings
+            .proton_choice
+            .get(&app_id.to_string())
+            .cloned()
+            .unwrap_or_else(|| self.settings.default_proton.clone())
+    }
+
+    fn tool_name(&self, key: &str) -> String {
+        launch::STEAM_PROTONS
+            .iter()
+            .find(|(id, _)| id.to_string() == key)
+            .map(|(_, n)| n.to_string())
+            .or_else(|| {
+                launch::installed_tools(&self.settings)
+                    .into_iter()
+                    .find(|t| t.key == key)
+                    .map(|t| t.name)
+            })
+            .unwrap_or_else(|| key.trim_start_matches("custom:").to_string())
+    }
+
+    /// Start a game, first fetching anything it needs: a pending update, the Proton build and
+    /// the Steam Linux Runtime it requires.
+    fn play(&mut self, app_id: u32) {
+        if self.running.contains_key(&app_id) {
+            return;
+        }
+        let Some(entry) = self.catalog.get(app_id).cloned() else {
+            return;
+        };
+        let Some(installed) = entry.install.clone() else {
+            self.emit(UiEvent::Message(format!(
+                "{} is not installed.",
+                entry.app.name
+            )));
+            return;
+        };
+        if installed.update_available || installed.manifest.needs_update() {
+            self.pending_launch = Some(app_id);
+            self.enqueue(app_id, false);
+            return;
+        }
+        let runtime = self.chosen_runtime(&entry);
+        let mut tool: Option<CompatTool> = None;
+        if runtime == Runtime::Proton {
+            let key = self.proton_key_for(app_id);
+            let tools = launch::installed_tools(&self.settings);
+            let mut missing = Vec::new();
+            match tools.into_iter().find(|t| t.key == key) {
+                Some(t) => {
+                    if let Some(req) =
+                        launch::read_toolmanifest(&t.dir).and_then(|m| m.require_tool_appid)
+                        && launch::installed_app_dir(&self.settings, req).is_none()
+                    {
+                        missing.push(req);
+                    }
+                    tool = Some(t);
+                }
+                None => match key.parse::<u32>() {
+                    Ok(id) => {
+                        missing.push(id);
+                        if launch::installed_app_dir(&self.settings, launch::SNIPER_APP_ID)
+                            .is_none()
+                        {
+                            missing.push(launch::SNIPER_APP_ID);
+                        }
+                    }
+                    Err(_) => {
+                        self.emit(UiEvent::Message(format!(
+                            "{} is not installed.",
+                            self.tool_name(&key)
+                        )));
+                        return;
+                    }
+                },
+            }
+            if !missing.is_empty() {
+                self.pending_launch = Some(app_id);
+                self.emit(UiEvent::Message(format!(
+                    "Installing {} before launch…",
+                    self.tool_name(&key)
+                )));
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = catalog::fetch_apps(&session, &missing)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::ToolsFetched(result));
+                });
+                return;
+            }
+        }
+
+        let Some(library) = self.settings.libraries.get(installed.library).cloned() else {
+            return;
+        };
+        let options = self
+            .settings
+            .launch_options
+            .get(&app_id.to_string())
+            .cloned()
+            .unwrap_or_default();
+        let ctx = launch::LaunchContext {
+            settings: &self.settings,
+            app: &entry.app,
+            manifest: &installed.manifest,
+            library: &library,
+            runtime,
+            tool: tool.as_ref(),
+            launch_options: &options,
+        };
+        let plan = match launch::plan(&ctx) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit(UiEvent::Message(format!(
+                    "Cannot start {}: {e}",
+                    entry.app.name
+                )));
+                return;
+            }
+        };
+        match spawn_game(app_id, &plan, self.tx.clone()) {
+            Ok(pgid) => {
+                info!(app_id, program = %plan.program.display(), "game started");
+                self.running.insert(app_id, pgid);
+            }
+            Err(e) => self.emit(UiEvent::Message(format!(
+                "Cannot start {}: {e}",
+                entry.app.name
+            ))),
+        }
+        self.publish();
+    }
+
+    fn publish_tools(&self) {
+        let installed = launch::installed_tools(&self.settings);
+        let mut tools: Vec<ToolInfo> = launch::STEAM_PROTONS
+            .iter()
+            .map(|(id, name)| ToolInfo {
+                key: id.to_string(),
+                name: name.to_string(),
+                installed: installed.iter().any(|t| t.key == id.to_string()),
+            })
+            .collect();
+        tools.extend(
+            installed
+                .iter()
+                .filter(|t| t.key.starts_with("custom:"))
+                .map(|t| ToolInfo {
+                    key: t.key.clone(),
+                    name: t.name.clone(),
+                    installed: true,
+                }),
+        );
+        self.emit(UiEvent::Tools {
+            tools,
+            default: self.settings.default_proton.clone(),
+        });
     }
 
     fn planned_size(&mut self, entry: &Entry, runtime: Runtime) -> u64 {
@@ -913,6 +1189,20 @@ impl Worker {
             })
             .collect();
         row.dlc_json = serde_json::Value::Array(dlc).to_string();
+        row.proton_key = self
+            .settings
+            .proton_choice
+            .get(&app.app_id.to_string())
+            .cloned()
+            .unwrap_or_default();
+        row.proton = self.tool_name(&self.proton_key_for(app.app_id));
+        row.launch_options = self
+            .settings
+            .launch_options
+            .get(&app.app_id.to_string())
+            .cloned()
+            .unwrap_or_default();
+        let running = self.running.contains_key(&app.app_id);
 
         match &entry.install {
             Some(installed) => {
@@ -927,7 +1217,9 @@ impl Worker {
                     .get(installed.library)
                     .map(|l| l.install_path(&m.install_dir).display().to_string())
                     .unwrap_or_default();
-                let (state, status) = if let Some(a) = active {
+                let (state, status) = if running {
+                    ("running", "Running".to_string())
+                } else if let Some(a) = active {
                     row.progress = if a.total > 0 {
                         a.done as f64 / a.total as f64
                     } else {
@@ -1096,6 +1388,34 @@ impl Worker {
         }
         self.emit(UiEvent::Libraries(out));
     }
+}
+
+/// Start a game in its own process group (so Stop reaches child processes too), logging its
+/// output to `<data>/logs/<appid>.log`.
+fn spawn_game(
+    app_id: u32,
+    plan: &launch::LaunchPlan,
+    tx: mpsc::UnboundedSender<Msg>,
+) -> std::io::Result<i32> {
+    use std::os::unix::process::CommandExt;
+    let logs = config::data_dir().join("logs");
+    std::fs::create_dir_all(&logs)?;
+    let log = std::fs::File::create(logs.join(format!("{app_id}.log")))?;
+    let mut cmd = plan.command();
+    cmd.process_group(0)
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .stdin(std::process::Stdio::null());
+    let mut child = tokio::process::Command::from(cmd).spawn()?;
+    let pgid = child.id().unwrap_or(0) as i32;
+    tokio::spawn(async move {
+        let status = match child.wait().await {
+            Ok(s) => s.to_string(),
+            Err(e) => e.to_string(),
+        };
+        let _ = tx.send(Msg::Exited(app_id, status));
+    });
+    Ok(pgid)
 }
 
 #[cfg(test)]

@@ -31,6 +31,8 @@ pub mod qobject {
         #[qproperty(QString, footer)]
         #[qproperty(bool, auto_update, cxx_name = "autoUpdate")]
         #[qproperty(QString, libraries_json, cxx_name = "librariesJson")]
+        #[qproperty(QString, tools_json, cxx_name = "toolsJson")]
+        #[qproperty(QString, default_proton, cxx_name = "defaultProton")]
         type Library = super::LibraryRust;
     }
 
@@ -128,6 +130,18 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setAutoUpdateEnabled"]
         fn set_auto_update_enabled(self: &Library, on: bool);
+        #[qinvokable]
+        fn stop(self: &Library, app_id: u32);
+        #[qinvokable]
+        #[cxx_name = "selectDefaultProton"]
+        fn select_default_proton(self: &Library, key: &QString);
+        /// Empty `key` returns the game to the default tool.
+        #[qinvokable]
+        #[cxx_name = "setProtonFor"]
+        fn set_proton_for(self: &Library, app_id: u32, key: &QString);
+        #[qinvokable]
+        #[cxx_name = "setLaunchOptions"]
+        fn set_launch_options(self: &Library, app_id: u32, options: &QString);
     }
 }
 
@@ -160,6 +174,9 @@ const ROLES: &[&str] = &[
     "updated",
     "location",
     "dlcJson",
+    "proton",
+    "protonKey",
+    "launchOptions",
 ];
 const USER_ROLE: i32 = 0x0100;
 
@@ -171,6 +188,8 @@ pub struct LibraryRust {
     footer: QString,
     auto_update: bool,
     libraries_json: QString,
+    tools_json: QString,
+    default_proton: QString,
     rows: Vec<Row>,
     worker: Option<worker::Handle>,
 }
@@ -206,6 +225,9 @@ fn row_value(row: &Row, role: usize) -> QVariant {
         Some("updated") => s(&row.updated),
         Some("location") => s(&row.location),
         Some("dlcJson") => s(&row.dlc_json),
+        Some("proton") => s(&row.proton),
+        Some("protonKey") => s(&row.proton_key),
+        Some("launchOptions") => s(&row.launch_options),
         _ => QVariant::default(),
     }
 }
@@ -240,6 +262,12 @@ impl qobject::Library {
                     .set_libraries_json(QString::from(json.as_str()));
             }
             UiEvent::Rows(rows) => self.set_rows(rows),
+            UiEvent::Tools { tools, default } => {
+                let json = serde_json::to_string(&tools).unwrap_or_else(|_| "[]".into());
+                self.as_mut().set_tools_json(QString::from(json.as_str()));
+                self.as_mut()
+                    .set_default_proton(QString::from(default.as_str()));
+            }
         }
     }
 
@@ -388,5 +416,27 @@ impl qobject::Library {
 
     pub fn set_auto_update_enabled(&self, on: bool) {
         self.send(Command::SetAutoUpdate(on));
+    }
+
+    pub fn stop(&self, app_id: u32) {
+        self.send(Command::Stop(app_id));
+    }
+
+    pub fn select_default_proton(&self, key: &QString) {
+        self.send(Command::SetDefaultProton(key.to_string()));
+    }
+
+    pub fn set_proton_for(&self, app_id: u32, key: &QString) {
+        self.send(Command::SetProtonFor {
+            app_id,
+            key: key.to_string(),
+        });
+    }
+
+    pub fn set_launch_options(&self, app_id: u32, options: &QString) {
+        self.send(Command::SetLaunchOptions {
+            app_id,
+            options: options.to_string(),
+        });
     }
 }
