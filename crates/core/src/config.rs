@@ -165,10 +165,44 @@ pub mod credentials {
         data_dir().join("accounts").join(format!("{safe}.token"))
     }
 
+    /// The keyring's Secret Service backend drives its own async runtime and blocks on it,
+    /// which panics when called from inside a tokio runtime (the app's worker). Run keyring
+    /// calls on a plain thread so they work from any context.
+    fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        std::thread::spawn(f).join().ok()
+    }
+
+    fn keyring_set(account: &str, token: &str) -> bool {
+        let (account, token) = (account.to_string(), token.to_string());
+        off_runtime(move || {
+            keyring::Entry::new(SERVICE, &account)
+                .and_then(|e| e.set_password(&token))
+                .is_ok()
+        })
+        .unwrap_or(false)
+    }
+
+    fn keyring_get(account: &str) -> Option<String> {
+        let account = account.to_string();
+        off_runtime(move || {
+            keyring::Entry::new(SERVICE, &account)
+                .and_then(|e| e.get_password())
+                .ok()
+        })
+        .flatten()
+    }
+
+    fn keyring_delete(account: &str) {
+        let account = account.to_string();
+        off_runtime(move || {
+            if let Ok(entry) = keyring::Entry::new(SERVICE, &account) {
+                let _ = entry.delete_credential();
+            }
+        });
+    }
+
     pub fn save(creds: &Credentials) -> std::io::Result<()> {
-        if let Ok(entry) = keyring::Entry::new(SERVICE, &creds.account)
-            && entry.set_password(&creds.refresh_token).is_ok()
-        {
+        if keyring_set(&creds.account, &creds.refresh_token) {
             let _ = std::fs::remove_file(file(&creds.account));
             return Ok(());
         }
@@ -186,9 +220,7 @@ pub mod credentials {
     }
 
     pub fn load(account: &str) -> Option<Credentials> {
-        let token = keyring::Entry::new(SERVICE, account)
-            .and_then(|e| e.get_password())
-            .ok()
+        let token = keyring_get(account)
             .or_else(|| std::fs::read_to_string(file(account)).ok())
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())?;
@@ -199,9 +231,7 @@ pub mod credentials {
     }
 
     pub fn forget(account: &str) {
-        if let Ok(entry) = keyring::Entry::new(SERVICE, account) {
-            let _ = entry.delete_credential();
-        }
+        keyring_delete(account);
         let _ = std::fs::remove_file(file(account));
     }
 }
@@ -229,5 +259,33 @@ mod tests {
         assert_eq!(s.default_library, 0);
         assert_eq!(s.default_library().unwrap().path, PathBuf::from("/games/b"));
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod keyring_tests {
+    use super::*;
+
+    /// Regression test: credential calls from inside a tokio runtime must not panic
+    /// (the keyring backend blocks on its own runtime).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credentials_usable_inside_runtime() {
+        let dir = std::env::temp_dir().join(format!("steamqt-cred-{}", std::process::id()));
+        // SAFETY: test-local override of the data directory.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        let creds = Credentials {
+            account: "probe_user".into(),
+            refresh_token: "token123".into(),
+        };
+        credentials::save(&creds).unwrap();
+        assert_eq!(
+            credentials::load("probe_user")
+                .map(|c| c.refresh_token)
+                .as_deref(),
+            Some("token123")
+        );
+        credentials::forget("probe_user");
+        assert!(credentials::load("probe_user").is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
