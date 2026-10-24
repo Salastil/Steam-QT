@@ -1,0 +1,31 @@
+[package]
+name = "steamqt-core"
+description = "Steam session, library and content management for Steam-QT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+flate2 = "1.1.10"
+futures-util = "0.3.34"
+reqwest = { version = "0.13", features = ["json"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+steam-vent = "0.5"
+steam-vent-proto = "0.5"
+steamroom = { version = "0.3", features = ["serde"] }
+steamroom-client = "0.3"
+thiserror = "2.0.21"
+tokio.workspace = true
+tokio-rustls = "0.26.6"
+tokio-tungstenite = "0.29"
+tracing.workspace = true
+url = "2.5.8"
+webpki-roots = "1.0.11"
+
+[dev-dependencies]
+anyhow.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
