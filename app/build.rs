@@ -15,5 +15,6 @@ fn main() {
     .qt_module("Quick")
     .files(["src/bridge.rs"])
     .cpp_file("src/app.cpp")
+    .qrc("resources.qrc")
     .build();
 }

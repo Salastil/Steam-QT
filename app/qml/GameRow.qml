@@ -20,6 +20,12 @@ Rectangle {
     border.color: win.frame
 
     HoverHandler { id: hover }
+    // Development aid: `--dlc=<appid>` opens that game's DLC dialog.
+    Timer {
+        running: win.devArgs.dlc !== undefined && parseInt(win.devArgs.dlc) === root.row.appId
+        interval: 800
+        onTriggered: { root.toggleExpanded(); dlcDialog.open() }
+    }
     TapHandler { onTapped: root.toggleExpanded() }
 
     ColumnLayout {
@@ -195,12 +201,21 @@ Rectangle {
                 Layout.fillWidth: true
             }
             Label { text: qsTr("DLC"); color: win.subtle }
-            Label {
+            RowLayout {
                 Layout.columnSpan: 3
                 Layout.fillWidth: true
-                wrapMode: Text.Wrap
-                text: root.dlc.length === 0 ? qsTr("None owned")
-                    : root.dlc.map(d => d.name + (d.enabled ? "" : " (off)")).join(", ")
+                spacing: 10
+                Label {
+                    text: root.dlc.length === 0 ? qsTr("None owned")
+                        : qsTr("%1 owned · %2 enabled").arg(root.dlc.length).arg(root.dlc.filter(d => d.enabled).length)
+                }
+                Button {
+                    visible: root.dlc.length > 0
+                    flat: true
+                    text: qsTr("Manage DLC…")
+                    onClicked: dlcDialog.open()
+                }
+                Item { Layout.fillWidth: true }
             }
             Label { text: qsTr("Location"); color: win.subtle; visible: root.installed }
             Label {
@@ -242,27 +257,9 @@ Rectangle {
                 onTriggered: lib.setRuntime(root.row.appId, "proton")
             }
         }
-        Menu {
-            id: dlcMenu
-            title: qsTr("DLC")
-            Instantiator {
-                model: root.dlc
-                delegate: MenuItem {
-                    required property var modelData
-                    text: modelData.name
-                    checkable: true
-                    checked: modelData.enabled
-                    enabled: root.installed && modelData.content
-                    onTriggered: lib.setDlc(root.row.appId, modelData.id, checked)
-                }
-                onObjectAdded: (i, o) => dlcMenu.insertItem(i, o)
-                onObjectRemoved: (i, o) => dlcMenu.removeItem(o)
-            }
-            MenuSeparator { visible: root.dlc.length > 0 }
-            MenuItem {
-                text: qsTr("Get more DLC in browser ↗")
-                onTriggered: Qt.openUrlExternally("https://store.steampowered.com/dlc/" + root.row.appId)
-            }
+        MenuItem {
+            text: root.dlc.length > 0 ? qsTr("DLC (%1)…").arg(root.dlc.length) : qsTr("DLC…")
+            onTriggered: dlcDialog.open()
         }
         MenuItem {
             text: qsTr("Launch options…")
@@ -327,6 +324,77 @@ Rectangle {
             }
             onObjectAdded: (i, o) => protonMenu.insertItem(i + 2, o)
             onObjectRemoved: (i, o) => protonMenu.removeItem(o)
+        }
+    }
+
+    // Owned DLC in a scrollable, filterable list (some games have hundreds).
+    Dialog {
+        id: dlcDialog
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(560, parent.width - 32)
+        height: Math.min(640, parent.height - 64)
+        modal: true
+        title: qsTr("DLC — %1").arg(root.row.title)
+        standardButtons: Dialog.Close
+        onAboutToShow: dlcFilter.text = ""
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 8
+            TextField {
+                id: dlcFilter
+                Layout.fillWidth: true
+                placeholderText: qsTr("Filter DLC…")
+                visible: root.dlc.length > 8
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: win.subtle
+                text: root.installed
+                      ? qsTr("Unticked DLC isn't downloaded; changes apply with the next update.")
+                      : qsTr("Install the game to choose which DLC content to download.")
+            }
+            Frame {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                padding: 0
+                background: Rectangle { color: palette.base; border.color: win.frame; radius: 4 }
+                ListView {
+                    id: dlcList
+                    anchors.fill: parent
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    model: {
+                        const f = dlcFilter.text.toLowerCase()
+                        return f ? root.dlc.filter(d => d.name.toLowerCase().includes(f)) : root.dlc
+                    }
+                    delegate: CheckDelegate {
+                        required property var modelData
+                        width: ListView.view.width
+                        text: modelData.name
+                        checked: modelData.enabled
+                        enabled: root.installed && modelData.content
+                        ToolTip.visible: hovered && !modelData.content
+                        ToolTip.text: qsTr("Unlock only — nothing to download")
+                        onToggled: lib.setDlc(root.row.appId, modelData.id, checked)
+                    }
+                    Label {
+                        anchors.centerIn: parent
+                        visible: dlcList.count === 0
+                        text: qsTr("No matching DLC")
+                        color: win.subtle
+                    }
+                }
+            }
+            Label {
+                text: qsTr("<a href=\"store\">Get more DLC in your browser ↗</a>")
+                textFormat: Text.StyledText
+                linkColor: palette.highlight
+                onLinkActivated: Qt.openUrlExternally("https://store.steampowered.com/dlc/" + root.row.appId)
+            }
         }
     }
 

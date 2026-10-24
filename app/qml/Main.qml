@@ -51,6 +51,7 @@ ApplicationWindow {
 
     Library {
         id: lib
+        objectName: "library"
         onMessage: (text) => toast.show(text)
     }
 
@@ -182,7 +183,7 @@ ApplicationWindow {
     readonly property var devArgs: {
         const o = {}
         for (const a of Qt.application.arguments) {
-            const m = a.match(/^--(screenshot|page|delay|expand|play)=(.*)$/)
+            const m = a.match(/^--(screenshot|page|delay|expand|play|dlc)=(.*)$/)
             if (m) o[m[1]] = m[2]
         }
         return o

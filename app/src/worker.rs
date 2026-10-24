@@ -880,13 +880,26 @@ impl Worker {
         self.emit(UiEvent::Footer("Loading library…".into()));
         tokio::spawn(async move {
             let result = match demo {
-                Some(apps) => catalog::fetch_apps(&session, &apps).await.map(|details| {
-                    Catalog::assemble(
-                        details,
-                        apps.iter().copied().collect(),
-                        catalog::scan_installed(&settings),
-                    )
-                }),
+                Some(apps) => {
+                    async {
+                        // Demo: the listed apps and all their DLC count as owned.
+                        let mut details = catalog::fetch_apps(&session, &apps).await?;
+                        let dlc: Vec<u32> = details
+                            .iter()
+                            .flat_map(|a| a.dlc.iter().copied())
+                            .take(500)
+                            .collect();
+                        let mut owned: HashSet<u32> = apps.iter().copied().collect();
+                        owned.extend(dlc.iter().copied());
+                        details.extend(catalog::fetch_apps(&session, &dlc).await?);
+                        Ok(Catalog::assemble(
+                            details,
+                            owned,
+                            catalog::scan_installed(&settings),
+                        ))
+                    }
+                    .await
+                }
                 None => Catalog::load(&session, &settings).await,
             }
             .map_err(|e| e.to_string());
