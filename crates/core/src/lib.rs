@@ -7,3 +7,4 @@ pub mod net;
 pub mod pics;
 pub mod session;
 pub mod vdf;
+pub mod workshop;

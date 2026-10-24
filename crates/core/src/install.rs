@@ -191,7 +191,7 @@ fn depotcache(lib: &LibraryFolder) -> PathBuf {
     lib.steamapps().join("depotcache")
 }
 
-fn cached_manifest_path(lib: &LibraryFolder, depot: u32, manifest: u64) -> PathBuf {
+pub(crate) fn cached_manifest_path(lib: &LibraryFolder, depot: u32, manifest: u64) -> PathBuf {
     depotcache(lib).join(format!("{depot}_{manifest}.manifest"))
 }
 
@@ -209,7 +209,7 @@ fn unzip_manifest(data: &[u8]) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn load_cached_manifest(
+pub(crate) fn load_cached_manifest(
     lib: &LibraryFolder,
     depot: u32,
     manifest: u64,
@@ -223,7 +223,7 @@ fn load_cached_manifest(
     Some(m)
 }
 
-fn old_file_layouts(old: &DepotManifest) -> HashMap<String, Vec<OldChunkLoc>> {
+pub(crate) fn old_file_layouts(old: &DepotManifest) -> HashMap<String, Vec<OldChunkLoc>> {
     old.files
         .iter()
         .filter(|f| !f.chunks.is_empty())
@@ -273,17 +273,30 @@ impl Meter {
     }
 }
 
-struct CdnContext {
-    cdn: CdnClient,
-    servers: Vec<steamroom::cdn::server::CdnServer>,
+pub(crate) struct CdnContext {
+    pub(crate) cdn: CdnClient,
+    pub(crate) servers: Vec<steamroom::cdn::server::CdnServer>,
 }
 
-async fn fetch_manifest(
+impl CdnContext {
+    pub(crate) async fn new(session: &Session) -> Result<Self, InstallError> {
+        let ctx = Self {
+            cdn: CdnClient::new().map_err(|e| InstallError::Cdn(e.to_string()))?,
+            servers: session.cdn_servers().await?,
+        };
+        if ctx.servers.is_empty() {
+            return Err(InstallError::Cdn("no content servers available".into()));
+        }
+        Ok(ctx)
+    }
+}
+
+pub(crate) async fn fetch_manifest(
     session: &Session,
     cdn: &CdnContext,
     app_id: u32,
     depot: &PlannedDepot,
-    branch: &str,
+    branch: Option<&str>,
     key: &DepotKey,
     lib: &LibraryFolder,
 ) -> Result<DepotManifest, InstallError> {
@@ -389,13 +402,7 @@ pub async fn install(
     manifest.disabled_dlc = req.disabled_dlc.clone();
     lib.write_manifest(&manifest)?;
 
-    let cdn = CdnContext {
-        cdn: CdnClient::new().map_err(|e| InstallError::Cdn(e.to_string()))?,
-        servers: session.cdn_servers().await?,
-    };
-    if cdn.servers.is_empty() {
-        return Err(InstallError::Cdn("no content servers available".into()));
-    }
+    let cdn = CdnContext::new(session).await?;
 
     let mut meter = Meter {
         tx: progress.clone(),
@@ -414,7 +421,7 @@ pub async fn install(
         }
         let key = session.depot_key(app_id, depot.depot_id).await?;
         let new_manifest =
-            fetch_manifest(session, &cdn, app_id, depot, &req.branch, &key, lib).await?;
+            fetch_manifest(session, &cdn, app_id, depot, Some(&req.branch), &key, lib).await?;
         keep_files.extend(new_manifest.files.iter().map(|f| f.normalized_path()));
 
         let installed = previous

@@ -142,6 +142,9 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setLaunchOptions"]
         fn set_launch_options(self: &Library, app_id: u32, options: &QString);
+        #[qinvokable]
+        #[cxx_name = "syncWorkshop"]
+        fn sync_workshop(self: &Library, app_id: u32);
     }
 }
 
@@ -416,6 +419,10 @@ impl qobject::Library {
 
     pub fn set_auto_update_enabled(&self, on: bool) {
         self.send(Command::SetAutoUpdate(on));
+    }
+
+    pub fn sync_workshop(&self, app_id: u32) {
+        self.send(Command::SyncWorkshop(app_id));
     }
 
     pub fn stop(&self, app_id: u32) {

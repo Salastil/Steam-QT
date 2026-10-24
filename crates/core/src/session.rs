@@ -597,13 +597,13 @@ impl Session {
         app_id: u32,
         depot_id: u32,
         manifest_id: u64,
-        branch: &str,
+        branch: Option<&str>,
     ) -> Result<u64> {
         let req = CContentServerDirectory_GetManifestRequestCode_Request {
             app_id: Some(app_id),
             depot_id: Some(depot_id),
             manifest_id: Some(manifest_id),
-            app_branch: Some(branch.to_string()),
+            app_branch: branch.map(str::to_string),
             ..Default::default()
         };
         Ok(self

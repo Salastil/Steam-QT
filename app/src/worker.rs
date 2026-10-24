@@ -97,6 +97,7 @@ pub enum Command {
         app_id: u32,
         options: String,
     },
+    SyncWorkshop(u32),
 }
 
 /// One row of the library list: either a section header or a game.
@@ -181,6 +182,7 @@ enum Msg {
     PollChanges,
     Changes(Result<session::PicsChanges, String>),
     AppsRefreshed(Vec<AppDetails>),
+    WorkshopSynced(u32, Result<steamqt_core::workshop::SyncReport, String>),
 }
 
 pub struct Handle {
@@ -244,6 +246,10 @@ struct Worker {
     running: HashMap<u32, i32>,
     /// Last PICS change number seen (0 = not yet known).
     change_number: u32,
+    /// Games whose workshop items are being synced.
+    workshop_syncing: HashSet<u32>,
+    /// Games whose workshop sync for the current launch is done.
+    workshop_ready: HashSet<u32>,
 }
 
 fn human_size(bytes: u64) -> String {
@@ -326,6 +332,8 @@ impl Worker {
             pending_launch: None,
             running: HashMap::new(),
             change_number: 0,
+            workshop_syncing: HashSet::new(),
+            workshop_ready: HashSet::new(),
             demo: std::env::var("STEAMQT_DEMO")
                 .ok()
                 .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()),
@@ -595,10 +603,36 @@ impl Worker {
                 self.queue_auto_updates();
                 self.publish();
             }
+            Msg::WorkshopSynced(app_id, result) => {
+                self.workshop_syncing.remove(&app_id);
+                match result {
+                    Ok(r) if r.downloaded + r.removed > 0 || !r.failed.is_empty() => {
+                        let mut text =
+                            format!("Workshop: {} updated, {} removed", r.downloaded, r.removed);
+                        if !r.failed.is_empty() {
+                            text.push_str(&format!(", {} failed", r.failed.len()));
+                        }
+                        self.emit(UiEvent::Message(text));
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(app_id, error = %e, "workshop sync failed"),
+                }
+                self.publish();
+                if self.pending_launch == Some(app_id) {
+                    self.pending_launch = None;
+                    self.workshop_ready.insert(app_id);
+                    self.play(app_id);
+                }
+            }
             Msg::InstallDone(app_id, result) => {
                 self.active = None;
                 match result {
-                    Ok(()) => info!(app_id, "install finished"),
+                    Ok(()) => {
+                        info!(app_id, "install finished");
+                        if self.catalog.get(app_id).is_some() {
+                            self.sync_workshop(app_id);
+                        }
+                    }
                     Err(e) if e == "cancelled" => {}
                     Err(e) => {
                         let name = self
@@ -787,6 +821,7 @@ impl Worker {
                 self.emit(UiEvent::AutoUpdate(on));
             }
             Command::Play(app_id) => self.play(app_id),
+            Command::SyncWorkshop(app_id) => self.sync_workshop(app_id),
             Command::Stop(app_id) => {
                 if let Some(&pgid) = self.running.get(&app_id) {
                     // SAFETY: signalling a process group we spawned; harmless if it has exited.
@@ -1161,6 +1196,13 @@ impl Worker {
             }
         }
 
+        // Like Steam, bring subscribed workshop items up to date before starting the game.
+        if self.demo.is_none() && !self.workshop_ready.remove(&app_id) {
+            self.pending_launch = Some(app_id);
+            self.sync_workshop(app_id);
+            return;
+        }
+
         let Some(library) = self.settings.libraries.get(installed.library).cloned() else {
             return;
         };
@@ -1200,6 +1242,30 @@ impl Worker {
             ))),
         }
         self.publish();
+    }
+
+    fn sync_workshop(&mut self, app_id: u32) {
+        let (Some(session), Some(entry)) = (self.session.clone(), self.catalog.get(app_id)) else {
+            return;
+        };
+        let Some(installed) = &entry.install else {
+            return;
+        };
+        let Some(library) = self.settings.libraries.get(installed.library).cloned() else {
+            return;
+        };
+        if !self.workshop_syncing.insert(app_id) {
+            return;
+        }
+        let app = entry.app.clone();
+        let tx = self.tx.clone();
+        self.publish();
+        tokio::spawn(async move {
+            let result = steamqt_core::workshop::sync(&session, &app, &library)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::WorkshopSynced(app_id, result));
+        });
     }
 
     fn publish_tools(&self) {
@@ -1330,6 +1396,8 @@ impl Worker {
                     .unwrap_or_default();
                 let (state, status) = if running {
                     ("running", "Running".to_string())
+                } else if self.workshop_syncing.contains(&app.app_id) {
+                    ("queued", "Syncing workshop items…".to_string())
                 } else if let Some(a) = active {
                     row.progress = if a.total > 0 {
                         a.done as f64 / a.total as f64

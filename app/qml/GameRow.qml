@@ -271,6 +271,12 @@ Rectangle {
             onTriggered: launchDialog.open()
         }
         MenuItem {
+            text: qsTr("Sync workshop items now")
+            visible: root.installed
+            height: visible ? implicitHeight : 0
+            onTriggered: lib.syncWorkshop(root.row.appId)
+        }
+        MenuItem {
             text: qsTr("Workshop in browser ↗")
             onTriggered: Qt.openUrlExternally("https://steamcommunity.com/app/" + root.row.appId + "/workshop/")
         }
