@@ -154,10 +154,12 @@ private:
 
     void toggleWindow()
     {
-        if (m_window->isVisible() && m_window->isActive()) {
+        // Toggle on visibility, not focus: clicking the tray gives the panel focus first, so the
+        // window is never "active" at that moment.
+        if (m_window->isVisible() && m_window->windowState() != Qt::WindowMinimized) {
             m_window->hide();
         } else {
-            m_window->show();
+            m_window->showNormal();
             m_window->raise();
             m_window->requestActivate();
         }
