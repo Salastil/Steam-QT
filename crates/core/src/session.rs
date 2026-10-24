@@ -303,6 +303,13 @@ impl From<&cmsg_client_license_list::License> for License {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RawAppInfo {
+    pub app_id: u32,
+    pub change_number: u32,
+    pub buffer: Option<Vec<u8>>,
+}
+
 /// A logged-in (or anonymous) connection to Steam.
 #[derive(Clone)]
 pub struct Session {
@@ -459,6 +466,20 @@ impl Session {
 
     /// App details, fetching access tokens as needed.
     pub async fn apps(&self, app_ids: &[u32]) -> Result<Vec<AppDetails>> {
+        Ok(self
+            .app_buffers(app_ids, false)
+            .await?
+            .into_iter()
+            .filter_map(|r| {
+                let kv = pics::parse_app_buffer(r.buffer.as_deref()?)?;
+                Some(AppDetails::from_kv(r.app_id, r.change_number, &kv))
+            })
+            .collect())
+    }
+
+    /// Raw PICS app info. With `meta_only`, only change numbers are returned (cheap), which
+    /// lets callers skip apps whose cached info is current.
+    pub async fn app_buffers(&self, app_ids: &[u32], meta_only: bool) -> Result<Vec<RawAppInfo>> {
         let mut out = Vec::with_capacity(app_ids.len());
         for batch in app_ids.chunks(PICS_BATCH) {
             let tokens = self.app_access_tokens(batch).await.unwrap_or_default();
@@ -471,22 +492,28 @@ impl Session {
                         ..Default::default()
                     })
                     .collect(),
-                meta_data_only: Some(false),
+                meta_data_only: Some(meta_only),
                 ..Default::default()
             };
             for resp in self.product_info(req).await? {
                 for a in &resp.apps {
                     let Some(id) = a.appid else { continue };
-                    let buffer = match a.buffer.as_deref() {
-                        Some(b) => Some(b.to_vec()),
-                        None => match (resp.http_host.as_deref(), a.sha.as_deref()) {
-                            (Some(host), Some(sha)) => fetch_appinfo_http(host, id, sha).await,
-                            _ => None,
-                        },
+                    let buffer = if meta_only {
+                        None
+                    } else {
+                        match a.buffer.as_deref() {
+                            Some(b) => Some(b.to_vec()),
+                            None => match (resp.http_host.as_deref(), a.sha.as_deref()) {
+                                (Some(host), Some(sha)) => fetch_appinfo_http(host, id, sha).await,
+                                _ => None,
+                            },
+                        }
                     };
-                    if let Some(kv) = buffer.as_deref().and_then(pics::parse_app_buffer) {
-                        out.push(AppDetails::from_kv(id, a.change_number.unwrap_or(0), &kv));
-                    }
+                    out.push(RawAppInfo {
+                        app_id: id,
+                        change_number: a.change_number.unwrap_or(0),
+                        buffer,
+                    });
                 }
             }
         }
