@@ -45,5 +45,14 @@ async fn main() -> anyhow::Result<()> {
             .map(|s| (&s.host, s.port, s.https))
             .collect::<Vec<_>>()
     );
+    let now = session.changes_since(0).await?;
+    println!("change number now: {}", now.current);
+    let recent = session
+        .changes_since(now.current.saturating_sub(200))
+        .await?;
+    println!(
+        "apps changed in last 200 changes: {:?}",
+        recent.apps.map(|a| a.len())
+    );
     Ok(())
 }

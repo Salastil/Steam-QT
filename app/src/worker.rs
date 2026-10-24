@@ -178,6 +178,9 @@ enum Msg {
     InstallDone(u32, Result<(), String>),
     ToolsFetched(Result<Vec<AppDetails>, String>),
     Exited(u32, String),
+    PollChanges,
+    Changes(Result<session::PicsChanges, String>),
+    AppsRefreshed(Vec<AppDetails>),
 }
 
 pub struct Handle {
@@ -239,6 +242,8 @@ struct Worker {
     pending_launch: Option<u32>,
     /// Running games: app id → process group id.
     running: HashMap<u32, i32>,
+    /// Last PICS change number seen (0 = not yet known).
+    change_number: u32,
 }
 
 fn human_size(bytes: u64) -> String {
@@ -320,6 +325,7 @@ impl Worker {
             tools: HashMap::new(),
             pending_launch: None,
             running: HashMap::new(),
+            change_number: 0,
             demo: std::env::var("STEAMQT_DEMO")
                 .ok()
                 .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()),
@@ -342,13 +348,15 @@ impl Worker {
         self.publish_tools();
         self.emit(UiEvent::AutoUpdate(self.settings.auto_update));
         self.try_resume();
-        let mut update_timer = tokio::time::interval(Duration::from_secs(30 * 60));
+        // Steam's change numbers advance constantly; polling them is cheap and tells us exactly
+        // which apps changed, so only those are refetched.
+        let mut update_timer = tokio::time::interval(Duration::from_secs(5 * 60));
         update_timer.tick().await;
         loop {
             let msg = tokio::select! {
                 Some(cmd) = commands.recv() => Msg::Cmd(cmd),
                 Some(msg) = self.rx.recv() => msg,
-                _ = update_timer.tick() => Msg::Cmd(Command::Refresh),
+                _ = update_timer.tick() => Msg::PollChanges,
                 else => break,
             };
             self.handle(msg);
@@ -465,18 +473,92 @@ impl Worker {
                 self.catalog = catalog;
                 self.publish();
                 self.publish_libraries();
-                if self.settings.auto_update {
-                    let pending: Vec<u32> = self
-                        .catalog
-                        .entries
-                        .iter()
-                        .filter(|e| e.install.as_ref().is_some_and(|i| i.update_available))
-                        .map(Entry::app_id)
-                        .collect();
-                    for app_id in pending {
-                        self.enqueue(app_id, false);
-                    }
+                self.queue_auto_updates();
+                if self.change_number == 0 {
+                    self.handle(Msg::PollChanges);
                 }
+                // Installed Proton builds and runtimes update like games.
+                let installed = catalog::scan_installed(&self.settings);
+                let tool_ids: Vec<u32> = launch::STEAM_PROTONS
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .chain([launch::SNIPER_APP_ID])
+                    .filter(|id| installed.contains_key(id))
+                    .collect();
+                if !tool_ids.is_empty()
+                    && let Some(session) = self.session.clone()
+                {
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(apps) = catalog::fetch_apps(&session, &tool_ids).await {
+                            let _ = tx.send(Msg::AppsRefreshed(apps));
+                        }
+                    });
+                }
+            }
+            Msg::PollChanges => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                let since = self.change_number;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = session
+                        .changes_since(since)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::Changes(result));
+                });
+            }
+            Msg::Changes(Err(e)) => warn!(error = %e, "PICS change poll failed"),
+            Msg::Changes(Ok(changes)) => {
+                let first = self.change_number == 0;
+                self.change_number = changes.current;
+                if first {
+                    info!(change_number = changes.current, "tracking PICS changes");
+                    return;
+                }
+                let Some(apps) = changes.apps.filter(|_| !changes.packages_changed) else {
+                    // Licences changed or Steam asked for a full refresh.
+                    self.load_catalog();
+                    return;
+                };
+                let installed: HashSet<u32> = catalog::scan_installed(&self.settings)
+                    .into_keys()
+                    .collect();
+                let relevant: Vec<u32> = apps
+                    .into_iter()
+                    .filter(|id| installed.contains(id))
+                    .collect();
+                if relevant.is_empty() {
+                    return;
+                }
+                info!(apps = ?relevant, "installed apps changed upstream");
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    match catalog::fetch_apps(&session, &relevant).await {
+                        Ok(apps) => {
+                            let _ = tx.send(Msg::AppsRefreshed(apps));
+                        }
+                        Err(e) => warn!(error = %e, "refetching changed apps failed"),
+                    }
+                });
+            }
+            Msg::AppsRefreshed(apps) => {
+                for app in apps {
+                    let id = app.app_id;
+                    if let Some(entry) = self.catalog.get_mut(id) {
+                        entry.app = app;
+                    } else {
+                        self.tools.insert(id, app);
+                    }
+                    self.refresh_install(id);
+                }
+                self.queue_auto_updates();
+                self.publish();
             }
             Msg::CatalogLoaded(Err(e)) => {
                 self.emit(UiEvent::Message(format!("Could not load library: {e}")))
@@ -510,6 +592,7 @@ impl Worker {
             Msg::Exited(app_id, status) => {
                 self.running.remove(&app_id);
                 info!(app_id, %status, "game exited");
+                self.queue_auto_updates();
                 self.publish();
             }
             Msg::InstallDone(app_id, result) => {
@@ -950,6 +1033,34 @@ impl Worker {
                 let _ = tx.send(Msg::InstallDone(app_id, result));
             });
             return;
+        }
+    }
+
+    /// Queue updates for installed games (and tool apps) behind their branch, when automatic
+    /// updates are on. Running games are left alone until they exit.
+    fn queue_auto_updates(&mut self) {
+        if !self.settings.auto_update {
+            return;
+        }
+        let mut pending: Vec<u32> = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| e.install.as_ref().is_some_and(|i| i.update_available))
+            .map(Entry::app_id)
+            .collect();
+        let installed = catalog::scan_installed(&self.settings);
+        for (id, app) in &self.tools {
+            if let Some((_, manifest)) = installed.get(id)
+                && install::needs_update(app, manifest)
+            {
+                pending.push(*id);
+            }
+        }
+        for app_id in pending {
+            if !self.running.contains_key(&app_id) {
+                self.enqueue(app_id, false);
+            }
         }
     }
 

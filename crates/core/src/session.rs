@@ -28,6 +28,7 @@ use steam_vent_proto::steammessages_clientserver_2::{
 };
 use steam_vent_proto::steammessages_clientserver_appinfo::{
     CMsgClientPICSAccessTokenRequest, CMsgClientPICSAccessTokenResponse,
+    CMsgClientPICSChangesSinceRequest, CMsgClientPICSChangesSinceResponse,
     CMsgClientPICSProductInfoRequest, CMsgClientPICSProductInfoResponse,
     cmsg_client_picsproduct_info_request,
 };
@@ -304,6 +305,13 @@ impl From<&cmsg_client_license_list::License> for License {
 }
 
 #[derive(Clone, Debug)]
+pub struct PicsChanges {
+    pub current: u32,
+    pub apps: Option<Vec<u32>>,
+    pub packages_changed: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct RawAppInfo {
     pub app_id: u32,
     pub change_number: u32,
@@ -518,6 +526,26 @@ impl Session {
             }
         }
         Ok(out)
+    }
+
+    /// Apps whose PICS info changed since `since` (0 just returns the current change number).
+    /// `None` in the app list means Steam asked for a full refresh.
+    pub async fn changes_since(&self, since: u32) -> Result<PicsChanges> {
+        let req = CMsgClientPICSChangesSinceRequest {
+            since_change_number: Some(since),
+            send_app_info_changes: Some(true),
+            send_package_info_changes: Some(true),
+            ..Default::default()
+        };
+        let resp: CMsgClientPICSChangesSinceResponse = self.conn.job(req).await?;
+        let full =
+            resp.force_full_update.unwrap_or(false) || resp.force_full_app_update.unwrap_or(false);
+        Ok(PicsChanges {
+            current: resp.current_change_number.unwrap_or(since),
+            apps: (!full).then(|| resp.app_changes.iter().filter_map(|c| c.appid).collect()),
+            packages_changed: !resp.package_changes.is_empty()
+                || resp.force_full_package_update.unwrap_or(false),
+        })
     }
 
     pub async fn depot_key(&self, app_id: u32, depot_id: u32) -> Result<DepotKey> {
