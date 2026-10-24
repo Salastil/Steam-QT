@@ -1,4 +1,8 @@
 // A row of mutually exclusive buttons (e.g. All / Native / Proton).
+//
+// Fully custom (label + background) rather than a styled Button: KDE's org.kde.desktop
+// style paints a Button's text as part of its background, so replacing the background to
+// show the selected state would hide the label.
 import QtQuick
 import QtQuick.Controls
 
@@ -12,28 +16,36 @@ Row {
 
     Repeater {
         model: seg.options
-        delegate: Button {
+        delegate: AbstractButton {
             id: btn
             required property string modelData
+            readonly property bool selected: seg.current === modelData
             text: modelData
-            checkable: true
-            checked: seg.current === modelData
-            font.pixelSize: seg.small ? 12 : 13
+            hoverEnabled: true
+            focusPolicy: Qt.TabFocus
             implicitHeight: seg.small ? 26 : 32
-            leftPadding: 10
-            rightPadding: 10
-            palette.buttonText: checked ? win.palette.highlightedText : win.palette.buttonText
+            implicitWidth: label.implicitWidth + 20
+            Accessible.role: Accessible.RadioButton
+            Accessible.checked: selected
+
+            contentItem: Label {
+                id: label
+                text: btn.text
+                font.pixelSize: seg.small ? 12 : 13
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                color: btn.selected ? win.palette.highlightedText : win.palette.buttonText
+            }
             background: Rectangle {
                 radius: 3
-                color: btn.checked ? win.palette.highlight
+                color: btn.selected ? win.palette.highlight
+                     : btn.down ? Qt.darker(win.palette.button, 1.1)
                      : btn.hovered ? Qt.lighter(win.palette.button, 1.12) : win.palette.button
-                border.color: btn.checked ? Qt.darker(win.palette.highlight, 1.15) : win.frame
+                border.color: btn.visualFocus ? win.palette.highlight
+                            : btn.selected ? Qt.darker(win.palette.highlight, 1.15) : win.frame
                 opacity: btn.enabled ? 1 : 0.5
             }
-            onClicked: {
-                checked = Qt.binding(() => seg.current === modelData)
-                seg.picked(modelData)
-            }
+            onClicked: if (!selected) seg.picked(modelData)
         }
     }
 }

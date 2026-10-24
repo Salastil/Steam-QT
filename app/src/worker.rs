@@ -1511,14 +1511,22 @@ impl Worker {
                     .catalog
                     .get(a.app_id)
                     .map(|e| e.app.name.as_str())
+                    .or_else(|| self.tools.get(&a.app_id).map(|t| t.name.as_str()))
                     .unwrap_or("");
+                let percent = (a.done * 100)
+                    .checked_div(a.total)
+                    .map(|p| format!(" {p}%"))
+                    .unwrap_or_default();
                 let queued = self.queue.len();
                 let queued = if queued > 0 {
                     format!(" · {queued} queued")
                 } else {
                     String::new()
                 };
-                format!("Downloading {name}{queued} · {}/s", human_size(a.rate))
+                format!(
+                    "Downloading {name}{percent}{queued} · {}/s",
+                    human_size(a.rate)
+                )
             }
             None if !self.queue.is_empty() => format!("{} queued", self.queue.len()),
             None => {
