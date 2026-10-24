@@ -12,6 +12,7 @@ flate2 = "1.1.10"
 futures-util = "0.3.34"
 keyring = { version = "3", features = ["async-secret-service", "tokio", "crypto-rust"] }
 libc = "0.2.191"
+prost = "0.14"
 reqwest = { version = "0.13", features = ["json"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8.5"

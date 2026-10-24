@@ -3413,6 +3413,7 @@ dependencies = [
  "futures-util",
  "keyring",
  "libc",
+ "prost",
  "reqwest",
  "rustls",
  "rustls-native-certs",

@@ -67,6 +67,18 @@ pub enum SessionError {
 
 pub type Result<T, E = SessionError> = std::result::Result<T, E>;
 
+impl SessionError {
+    /// Whether retrying on another server could help.
+    fn is_network(&self) -> bool {
+        match self {
+            SessionError::Net(_) | SessionError::Network(_) | SessionError::Directory(_) => true,
+            SessionError::Connection(e) => !matches!(e, steam_vent::ConnectionError::LoginError(_)),
+            SessionError::Login(LoginError::Transport(e)) => eresult_of(e).is_none(),
+            _ => false,
+        }
+    }
+}
+
 /// Pick connection-manager WebSocket endpoints from Steam's directory, best first.
 pub async fn discover_cms(cell_id: u32) -> Result<Vec<String>> {
     #[derive(serde::Deserialize)]
@@ -131,20 +143,28 @@ where
     F: Fn(net::WsStream) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
+    // A server that accepts the socket but never answers must not hang the UI.
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
     let mut last = SessionError::Directory("no servers tried".into());
     for endpoint in discover_cms(0).await?.iter().take(6) {
         let url = net::cm_url(endpoint);
-        match net::connect_ws(&url).await {
-            Ok(ws) => match f(ws).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    warn!(%endpoint, error = %e, "CM handshake failed");
-                    last = e;
-                }
-            },
-            Err(e) => {
-                warn!(%endpoint, error = %e, "CM connect failed");
-                last = e.into();
+        debug!(%endpoint, "connecting to CM");
+        let attempt = async {
+            let ws = net::connect_ws(&url).await?;
+            f(ws).await
+        };
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, attempt).await {
+            Ok(Ok(v)) => return Ok(v),
+            // Only connection problems are worth another server; a rejected password or
+            // logon would just be rejected again (and repeated attempts get rate limited).
+            Ok(Err(e)) if !e.is_network() => return Err(e),
+            Ok(Err(e)) => {
+                warn!(%endpoint, error = %e, "CM attempt failed");
+                last = e;
+            }
+            Err(_) => {
+                warn!(%endpoint, "CM did not respond in time");
+                last = SessionError::Other(format!("Steam server {endpoint} did not respond"));
             }
         }
     }
@@ -227,31 +247,82 @@ struct GuardSession {
     code_kind: GuardType,
 }
 
+/// How long a Steam Guard challenge may stay open before giving up.
+const GUARD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 impl GuardSession {
-    fn credentials(&self, tokens: steamroom::auth::AuthTokens) -> Credentials {
-        Credentials {
-            account: tokens.account_name.unwrap_or_else(|| self.account.clone()),
-            refresh_token: tokens.refresh_token,
+    /// One `PollAuthSessionStatus` call. Steam can rotate the client id (`new_client_id`),
+    /// which later polls and code submissions must use, and for the SteamClient platform the
+    /// refresh token is what matters (the access token may be absent).
+    async fn poll(&mut self) -> std::result::Result<Option<Credentials>, steamroom::Error> {
+        use prost::Message;
+        let req = steamroom::generated::CAuthenticationPollAuthSessionStatusRequest {
+            client_id: Some(self.client_id),
+            request_id: Some(self.request_id.clone()),
+            ..Default::default()
+        };
+        let resp = self
+            .client
+            .call_service_method_non_authed(
+                "Authentication.PollAuthSessionStatus#1",
+                &req.encode_to_vec(),
+            )
+            .await?;
+        let r: steamroom::generated::CAuthenticationPollAuthSessionStatusResponse =
+            resp.decode().map_err(steamroom::Error::from)?;
+        if let Some(id) = r
+            .new_client_id
+            .filter(|&id| id != 0 && id != self.client_id)
+        {
+            debug!(
+                old = self.client_id,
+                new = id,
+                "auth session client id rotated"
+            );
+            self.client_id = id;
         }
+        debug!(
+            refresh = r.refresh_token.as_deref().is_some_and(|t| !t.is_empty()),
+            access = r.access_token.as_deref().is_some_and(|t| !t.is_empty()),
+            "auth session polled"
+        );
+        Ok(r.refresh_token
+            .filter(|t| !t.is_empty())
+            .map(|refresh_token| Credentials {
+                account: r
+                    .account_name
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| self.account.clone()),
+                refresh_token,
+            }))
     }
 
     async fn run(
-        self,
+        mut self,
         mut codes: tokio::sync::mpsc::UnboundedReceiver<String>,
         events: tokio::sync::mpsc::UnboundedSender<AuthEvent>,
     ) {
+        let deadline = tokio::time::Instant::now() + GUARD_TIMEOUT;
         let mut ticker = tokio::time::interval(self.interval);
         ticker.tick().await;
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = events.send(AuthEvent::Failed(SessionError::Other(
+                        "Steam Guard confirmation timed out. Sign in again.".into(),
+                    )));
+                    return;
+                }
                 _ = ticker.tick() => {
-                    match self.client.poll_auth_session(self.client_id, &self.request_id).await {
-                        Ok(Some(tokens)) => {
-                            let _ = events.send(AuthEvent::Done(self.credentials(tokens)));
+                    match self.poll().await {
+                        Ok(Some(creds)) => {
+                            info!("Steam Guard confirmed");
+                            let _ = events.send(AuthEvent::Done(creds));
                             return;
                         }
                         Ok(None) => {}
                         Err(e) => {
+                            warn!(error = %e, "auth session poll failed");
                             let _ = events.send(AuthEvent::Failed(LoginError::Transport(e).into()));
                             return;
                         }
@@ -260,7 +331,10 @@ impl GuardSession {
                 code = codes.recv() => {
                     let Some(code) = code else { return };
                     match self.client.submit_steam_guard_code(self.client_id, self.steam_id, &code, self.code_kind).await {
-                        Ok(()) => ticker.reset_immediately(),
+                        Ok(()) => {
+                            info!("Steam Guard code accepted, waiting for tokens");
+                            ticker.reset_immediately();
+                        }
                         Err(e) => match eresult_of(&e) {
                             // 88 TwoFactorCodeMismatch (authenticator), 65 InvalidLoginAuthCode (email).
                             Some(steamroom::enums::EResultError::TwoFactorCodeMismatch
@@ -270,6 +344,7 @@ impl GuardSession {
                             // Already approved (e.g. on the phone): the next poll returns tokens.
                             Some(steamroom::enums::EResultError::DuplicateRequest) => ticker.reset_immediately(),
                             _ => {
+                                warn!(error = %e, "submitting Steam Guard code failed");
                                 let _ = events.send(AuthEvent::Failed(LoginError::Transport(e).into()));
                                 return;
                             }
@@ -335,7 +410,7 @@ pub async fn authenticate(account: &str, password: &str) -> Result<AuthStep> {
     })
     .await?;
 
-    let guard = GuardSession {
+    let mut guard = GuardSession {
         client,
         account: account.clone(),
         client_id: session
@@ -364,13 +439,8 @@ pub async fn authenticate(account: &str, password: &str) -> Result<AuthStep> {
         // No Steam Guard: tokens are ready after the first poll.
         loop {
             tokio::time::sleep(guard.interval).await;
-            if let Some(tokens) = guard
-                .client
-                .poll_auth_session(guard.client_id, &guard.request_id)
-                .await
-                .map_err(LoginError::from)?
-            {
-                return Ok(AuthStep::Done(guard.credentials(tokens)));
+            if let Some(creds) = guard.poll().await.map_err(LoginError::from)? {
+                return Ok(AuthStep::Done(creds));
             }
         }
     }
@@ -450,7 +520,7 @@ impl Session {
             }
         })
         .await?;
-        info!(steam_id = u64::from(conn.steam_id()), "logged in");
+        info!(steam_id = u64::from(conn.steam_id()), account = %credentials.account, "logged in");
         Self::start(conn, Some(credentials.account.clone())).await
     }
 
